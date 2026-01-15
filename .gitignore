@@ -1,0 +1,12 @@
+# Rust / Cargo
+target/
+
+# redo state + temporary outputs
+.redo/
+*.redo.tmp
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+

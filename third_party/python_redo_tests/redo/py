@@ -1,0 +1,8 @@
+#!/bin/sh
+set -e
+
+# Apache-2.0: helper interface used by the vendored test suite.
+# This wrapper intentionally avoids absolute paths to local virtualenvs.
+
+exec python3 "$@"
+

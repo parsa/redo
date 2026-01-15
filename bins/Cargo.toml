@@ -1,0 +1,57 @@
+[package]
+name = "redo_bins"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+redo_core = { path = "../redo_core" }
+sha1.workspace = true
+pathdiff.workspace = true
+libc.workspace = true
+
+[[bin]]
+name = "redo"
+path = "src/redo.rs"
+
+[[bin]]
+name = "redo-ifchange"
+path = "src/redo_ifchange.rs"
+
+[[bin]]
+name = "redo-ifcreate"
+path = "src/redo_ifcreate.rs"
+
+[[bin]]
+name = "redo-always"
+path = "src/redo_always.rs"
+
+[[bin]]
+name = "redo-stamp"
+path = "src/redo_stamp.rs"
+
+[[bin]]
+name = "redo-log"
+path = "src/redo_log.rs"
+
+[[bin]]
+name = "redo-ood"
+path = "src/redo_ood.rs"
+
+[[bin]]
+name = "redo-targets"
+path = "src/redo_targets.rs"
+
+[[bin]]
+name = "redo-sources"
+path = "src/redo_sources.rs"
+
+[[bin]]
+name = "redo-whichdo"
+path = "src/redo_whichdo.rs"
+
+[[bin]]
+name = "redo-unlocked"
+path = "src/redo_unlocked.rs"
+

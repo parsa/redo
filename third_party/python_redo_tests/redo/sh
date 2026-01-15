@@ -1,0 +1,7 @@
+#!/bin/sh
+
+# Apache-2.0: helper interface used by the vendored test suite.
+# Provide a stable, portable path for dependency tracking.
+
+exec /bin/sh "$@"
+

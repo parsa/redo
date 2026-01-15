@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo test
+        run: cargo test --workspace
+
+      - name: Cargo build
+        run: cargo build --workspace
+
+      - name: Integration test - atomic crash window
+        run: bash scripts/test_atomic_crash_window.sh
+
+      - name: Integration test - honest script + nonfile
+        run: bash scripts/test_honest_script_and_nonfile.sh
+
+      - name: Integration test - parallelism
+        run: bash scripts/test_parallelism.sh
+
+      - name: Integration test - redo-log follow + options
+        run: bash scripts/test_redo_log_follow_and_options.sh
+
+      - name: Integration test - redo-log interleaving
+        run: bash scripts/test_redo_log_interleaving.sh
+
+      - name: Integration test - SIGINT
+        run: bash scripts/test_sigint.sh
+
+      - name: Integration test - target intent persisted
+        run: bash scripts/test_target_intent_persisted.sh
+
+      - name: Integration test - toplevel redo-log pipe
+        run: bash scripts/test_toplevel_redo_log_pipe.sh
+

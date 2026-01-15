@@ -1,0 +1,16 @@
+[package]
+name = "redo_core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+nix.workspace = true
+pathdiff.workspace = true
+sha1.workspace = true
+once_cell.workspace = true
+

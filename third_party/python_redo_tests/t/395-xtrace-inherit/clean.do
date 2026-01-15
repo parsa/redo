@@ -1,0 +1,2 @@
+rm -f checkx checkv *~ .*~
+
