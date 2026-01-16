@@ -204,7 +204,11 @@ fn main() {
     let targets = args;
 
     // Initialize state so env/base/runid are available before we potentially fork redo-log.
-    let _ = state::init(&targets);
+    // Don't ignore errors here: later code assumes env/state are initialized.
+    if let Err(e) = state::init(&targets) {
+        eprintln!("{:?}", e);
+        std::process::exit(1);
+    }
 
     // Configure logging output mode (pretty vs raw) for non redo-log cases.
     logs::setup(env::v().log != 0, env::v().pretty, env::v().color);

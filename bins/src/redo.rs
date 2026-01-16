@@ -315,7 +315,11 @@ fn main() {
     set_defint("REDO_COLOR", color);
 
     // Initialize state so env/base/runid are available before we potentially fork redo-log.
-    let _ = state::init(&targets);
+    // Don't ignore errors here: later code assumes env/state are initialized.
+    if let Err(e) = state::init(&targets) {
+        eprintln!("{:?}", e);
+        std::process::exit(1);
+    }
 
     // When fcntl locks are broken (eg. WSL), disable parallelism and redo-log for safety.
     if (env::is_toplevel() || jobs > 1) && env::v().locks_broken {

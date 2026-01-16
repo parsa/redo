@@ -16,7 +16,10 @@ fn main() {
     }
 
     // Init env, then enumerate possible `.do` files.
-    let _ = env::init_no_state();
+    if let Err(e) = env::init_no_state() {
+        eprintln!("{:?}", e);
+        std::process::exit(1);
+    }
     let base = env::v().base;
 
     // Print paths relative to '.' for each candidate.

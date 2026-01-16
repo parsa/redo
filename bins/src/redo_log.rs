@@ -563,19 +563,6 @@ fn catlog(
     already.insert(t.to_string());
     let mydir = Path::new(t).parent().unwrap_or(Path::new(""));
 
-    let f = match state::File::by_name(t, false) {
-        Ok(f) => f,
-        Err(_) => {
-            writeln!(
-                std::io::stderr(),
-                "redo-log: [{}] {:?}: not known to redo.",
-                std::env::current_dir()?.to_string_lossy(),
-                top_arg
-            )?;
-            std::process::exit(24);
-        }
-    };
-
     // Follow-mode race: redo-log might start just before the target becomes locked
     // (especially when there's already an old log file from a previous run).
     // Give a short grace period before treating an unlocked target as "idle".
@@ -585,13 +572,36 @@ fn catlog(
     // slower machines / under load; keep this comfortably above that.
     const FOLLOW_START_GRACE: Duration = Duration::from_secs(3);
 
+    // In follow mode, also tolerate starting before the target is even recorded in the DB.
+    // This can happen if `redo` is launched in the background and `redo-log -f` starts
+    // immediately after.
+    let mut last_status = Instant::now();
+    let f = loop {
+        match state::File::by_name(t, false) {
+            Ok(f) => break f,
+            Err(_) if follow && follow_grace_start.elapsed() < FOLLOW_START_GRACE => {
+                let _ = maybe_print_status(status, start, &mut last_status, *total_lines, top_arg);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => {
+                writeln!(
+                    std::io::stderr(),
+                    "redo-log: [{}] {:?}: not known to redo.",
+                    std::env::current_dir()?.to_string_lossy(),
+                    top_arg
+                )?;
+                std::process::exit(24);
+            }
+        }
+    };
+
     // Hold a shared "log lock" while reading the log file.
     // This coordinates with writers (and avoids some truncation/race issues).
     let mut loglock = state::Lock::new(f.id + state::LOG_LOCK_MAGIC)?;
     let _ = loglock.waitlock(true);
 
     let logpath = state::logname(f.id);
-    let mut last_status = Instant::now();
     let mut status_active = false;
     let mut line_head = String::new();
     let mut lf = loop {

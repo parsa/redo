@@ -47,3 +47,25 @@ jobs:
       - name: Integration test - toplevel redo-log pipe
         run: bash scripts/test_toplevel_redo_log_pipe.sh
 
+  stress:
+    needs: test
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo build
+        run: cargo build --workspace
+
+      - name: Stress (race-sensitive integration tests)
+        env:
+          # Run fewer iterations on PRs to keep CI latency reasonable.
+          REDO_STRESS_ITERS: ${{ github.event_name == 'pull_request' && '10' || '25' }}
+          REDO_STRESS_JITTER_MS: "50"
+        run: bash scripts/ci_stress.sh
