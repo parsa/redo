@@ -60,7 +60,25 @@ if [ -n "$TIMEOUT_BIN" ]; then
     exit 12
   }
 else
-  redo sleepy >/dev/null 2>&1 || { echo "FAIL: redo did not recover after SIGINT" >&2; exit 12; }
+  set +e
+  redo sleepy >/dev/null 2>&1 &
+  pid2=$!
+  timed_out2="$tmp/timed_out_recover"
+  (
+    sleep "$TIMEOUT_SECS"
+    echo "FAIL: redo did not recover after SIGINT (timeout ${TIMEOUT_SECS}s)" >&2
+    echo 1 >"$timed_out2"
+    kill -KILL "-$pid2" 2>/dev/null || kill -KILL "$pid2" 2>/dev/null || true
+  ) &
+  watchdog2=$!
+  wait "$pid2"
+  rv2=$?
+  kill "$watchdog2" 2>/dev/null || true
+  wait "$watchdog2" 2>/dev/null || true
+  set -e
+
+  [ ! -e "$timed_out2" ] || exit 12
+  [ "$rv2" -eq 0 ] || { echo "FAIL: redo did not recover after SIGINT" >&2; exit 12; }
 fi
 
 exit 0

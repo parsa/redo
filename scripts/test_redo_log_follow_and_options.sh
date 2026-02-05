@@ -56,11 +56,43 @@ echo end >&2
 echo ok >"$3"
 EOF
 
+TIMEOUT_SECS="${REDO_TEST_TIMEOUT_SECS:-20}"
+if [ "$TIMEOUT_SECS" -gt 20 ]; then TIMEOUT_SECS=20; fi
+
+set +e
 redo slow >/dev/null 2>&1 &
-pid=$!
+redopid=$!
 sleep 0.05
-redo-log -f slow >follow.out
-wait "$pid"
+redo-log -f slow >follow.out &
+logpid=$!
+
+timed_out="$tmp/timed_out"
+(
+  sleep "$TIMEOUT_SECS"
+  echo "FAIL: redo-log follow test timed out (${TIMEOUT_SECS}s)" >&2
+  echo 1 >"$timed_out"
+  kill -KILL "$logpid" 2>/dev/null || true
+  kill -KILL "-$redopid" 2>/dev/null || kill -KILL "$redopid" 2>/dev/null || true
+) &
+watchdog=$!
+
+wait "$redopid"
+rv_redo=$?
+wait "$logpid"
+rv_log=$?
+
+kill "$watchdog" 2>/dev/null || true
+wait "$watchdog" 2>/dev/null || true
+set -e
+
+[ ! -e "$timed_out" ] || exit 20
+[ "$rv_redo" -eq 0 ] || { echo "FAIL: redo slow failed (exit $rv_redo)" >&2; exit 20; }
+[ "$rv_log" -eq 0 ] || {
+  echo "FAIL: redo-log -f slow failed (exit $rv_log)" >&2
+  echo "--- follow.out ---" >&2
+  cat follow.out >&2 || true
+  exit 20
+}
 
 grep -q 'start' follow.out || {
   echo "FAIL: missing start in follow output" >&2

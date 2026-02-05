@@ -77,10 +77,25 @@ if [ -n "$TIMEOUT_BIN" ]; then
     exit 10
   }
 else
-  redo x >/dev/null 2>&1 || {
-    echo "FAIL: redo x did not finish successfully" >&2
-    exit 10
-  }
+  set +e
+  redo x >/dev/null 2>&1 &
+  pid=$!
+  timed_out="$tmp/timed_out"
+  (
+    sleep "$TIMEOUT_SECS"
+    echo "FAIL: redo x did not finish successfully (timeout ${TIMEOUT_SECS}s)" >&2
+    echo 1 >"$timed_out"
+    kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+  ) &
+  watchdog=$!
+  wait "$pid"
+  rv=$?
+  kill "$watchdog" 2>/dev/null || true
+  wait "$watchdog" 2>/dev/null || true
+  set -e
+
+  [ ! -e "$timed_out" ] || exit 10
+  [ "$rv" -eq 0 ] || { echo "FAIL: redo x did not finish successfully" >&2; exit 10; }
 fi
 
 [ -f "$tmp/invoked" ] || { echo "FAIL: fake redo-log was not invoked" >&2; exit 11; }
