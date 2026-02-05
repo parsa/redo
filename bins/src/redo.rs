@@ -180,6 +180,14 @@ fn start_stdin_log_reader(
 }
 
 fn main() {
+    let default_panic = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if GOT_SIGINT.load(Ordering::SeqCst) {
+            unsafe { libc::_exit(200) };
+        }
+        default_panic(info);
+    }));
+
     // Put redo and its children into their own process group so we can
     // propagate SIGINT cleanly.
     unsafe {

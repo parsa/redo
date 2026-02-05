@@ -62,9 +62,26 @@ sleep 0.05
 redo-log -f slow >follow.out
 wait "$pid"
 
-grep -q 'start' follow.out || { echo "FAIL: missing start in follow output" >&2; exit 21; }
-grep -q 'middle' follow.out || { echo "FAIL: missing middle in follow output" >&2; exit 22; }
-grep -q 'end' follow.out || { echo "FAIL: missing end in follow output" >&2; exit 23; }
+grep -q 'start' follow.out || {
+  echo "FAIL: missing start in follow output" >&2
+  echo "--- follow.out ---" >&2
+  cat follow.out >&2 || true
+  echo "--- .redo dir listing ---" >&2
+  (ls -la .redo >&2) || true
+  exit 21
+}
+grep -q 'middle' follow.out || {
+  echo "FAIL: missing middle in follow output" >&2
+  echo "--- follow.out ---" >&2
+  cat follow.out >&2 || true
+  exit 22
+}
+grep -q 'end' follow.out || {
+  echo "FAIL: missing end in follow output" >&2
+  echo "--- follow.out ---" >&2
+  cat follow.out >&2 || true
+  exit 23
+}
 
 exit 0
 

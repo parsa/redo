@@ -26,7 +26,8 @@ if command -v timeout >/dev/null 2>&1; then
 fi
 
 set +e
-redo -j2 sleepy >/dev/null 2>&1 &
+out="$tmp/redo.out"
+redo -j2 sleepy >"$out" 2>&1 &
 pid=$!
 timed_out="$tmp/timed_out"
 (
@@ -45,7 +46,12 @@ wait "$watchdog" 2>/dev/null || true
 set -e
 
 [ ! -e "$timed_out" ] || exit 13
-[ "$rv" -eq 200 ] || { echo "FAIL: expected exit 200 on SIGINT, got $rv" >&2; exit 11; }
+[ "$rv" -eq 200 ] || {
+  echo "FAIL: expected exit 200 on SIGINT, got $rv" >&2
+  echo "--- redo output (tail) ---" >&2
+  tail -200 "$out" >&2 || true
+  exit 11
+}
 
 # Ensure a follow-up run works (no stuck locks).
 if [ -n "$TIMEOUT_BIN" ]; then
