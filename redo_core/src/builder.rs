@@ -174,10 +174,8 @@ fn exec_dofile_in_child(
             // Create the per-target log file via temp+rename so readers never see a
             // log file truncated mid-read.
             let logdir = logpath.parent().unwrap_or_else(|| Path::new("."));
-            let tmpl = format!(
-                "{}/redo.XXXXXX.log.tmp",
-                logdir.to_string_lossy().to_string()
-            );
+            // mkstemp requires the template to end with XXXXXX.
+            let tmpl = format!("{}/redo.XXXXXX", logdir.to_string_lossy().to_string());
             let mut template = CString::new(tmpl).unwrap().into_bytes_with_nul();
             let fd = unsafe { libc::mkstemp(template.as_mut_ptr() as *mut libc::c_char) };
             if fd >= 0 {
