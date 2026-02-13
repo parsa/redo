@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,93 @@ struct Ansi {
     yellow: &'static str,
     bold: &'static str,
     plain: &'static str,
+}
+
+#[derive(Default)]
+struct Progress {
+    // Absolute, lexically-normalized paths.
+    seen: HashSet<String>,
+    running: HashSet<String>,
+    done: HashSet<String>,
+    failed: HashSet<String>,
+    uptodate: HashSet<String>,
+    // Optional plan set for stable "total steps" progress display.
+    planned_steps: Option<HashSet<String>>,
+    // Optional preflight plan totals (emitted by `redo` as @@REDO:plan@@).
+    plan_dirty_total: Option<usize>,
+    plan_total: Option<usize>,
+    plan_uptodate_total: Option<usize>,
+}
+
+impl Progress {
+    fn counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.seen.len(),
+            self.running.len(),
+            self.done.len(),
+            self.failed.len(),
+        )
+    }
+
+    fn has_dirty_plan(&self) -> bool {
+        self.plan_dirty_total.is_some()
+    }
+
+    fn set_plan_totals(&mut self, dirty: usize, total: usize, uptodate: usize) {
+        self.plan_dirty_total = Some(dirty);
+        self.plan_total = Some(total);
+        self.plan_uptodate_total = Some(uptodate);
+    }
+
+    fn note_seen(&mut self, key: String) {
+        self.seen.insert(key);
+    }
+
+    fn note_started(&mut self, key: String) {
+        self.seen.insert(key.clone());
+        self.running.insert(key.clone());
+        // If a target is re-done in a single run (rare), treat it as active again.
+        self.done.remove(&key);
+        self.uptodate.remove(&key);
+        self.failed.remove(&key);
+    }
+
+    fn note_running(&mut self, key: String) {
+        self.seen.insert(key.clone());
+        self.running.insert(key);
+    }
+
+    fn note_unchanged(&mut self, key: String) {
+        self.seen.insert(key.clone());
+        self.running.remove(&key);
+        self.done.insert(key.clone());
+        self.uptodate.remove(&key);
+        self.failed.remove(&key);
+    }
+
+    fn note_uptodate(&mut self, key: String) {
+        self.seen.insert(key.clone());
+        self.running.remove(&key);
+        self.done.remove(&key);
+        self.failed.remove(&key);
+        self.uptodate.insert(key);
+    }
+
+    fn note_done(&mut self, key: String, rv: i32) {
+        self.seen.insert(key.clone());
+        self.running.remove(&key);
+        self.done.insert(key.clone());
+        self.uptodate.remove(&key);
+        if rv != 0 {
+            self.failed.insert(key);
+        } else {
+            self.failed.remove(&key);
+        }
+    }
+}
+
+fn abs_key(topdir: &Path, mydir: &Path, p: &str) -> String {
+    normalize(topdir.join(mydir).join(p))
 }
 
 fn isatty(fd: i32) -> bool {
@@ -231,6 +318,34 @@ fn real_main() -> anyhow::Result<()> {
     let topdir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let start = Instant::now();
     let mut total_lines: u64 = 0;
+    let mut progress = Progress::default();
+    let stdin_mode = targets.iter().any(|t| t == "-");
+
+    // If redo (toplevel) told us the intended roots, try to load a
+    // generator-provided plan manifest for a stable total.
+    if stdin_mode {
+        if let Ok(v) = std::env::var("REDO_LOG_TOP_TARGETS") {
+            let roots: Vec<String> = v
+                .split('\n')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect();
+            if let Some(plan_all) = load_plan_targets(&env::v().base) {
+                if !plan_all.is_empty() {
+                    // "all" is the common case and typically spans most of the build tree.
+                    // Avoid a potentially-expensive closure walk and just use the full plan.
+                    let building_all = roots.iter().any(|r| r == "all");
+                    if building_all || roots.is_empty() {
+                        progress.planned_steps = Some(plan_all);
+                    } else {
+                        progress.planned_steps =
+                            Some(compute_plan_scope(&env::v().base, &plan_all, &roots));
+                    }
+                }
+            }
+        }
+    }
 
     let mut out = std::io::stdout();
     for t in targets {
@@ -252,6 +367,7 @@ fn real_main() -> anyhow::Result<()> {
                 status,
                 start,
                 &mut total_lines,
+                &mut progress,
                 &mut already,
                 &mut out,
             )?;
@@ -279,6 +395,7 @@ fn real_main() -> anyhow::Result<()> {
             status,
             start,
             &mut total_lines,
+            &mut progress,
             &mut already,
             &mut out,
         )?;
@@ -300,6 +417,7 @@ fn catlog_stdin(
     status: i32,
     start: Instant,
     total_lines: &mut u64,
+    progress: &mut Progress,
     already: &mut HashSet<String>,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -335,12 +453,24 @@ fn catlog_stdin(
 
             // Meta-line handling + inline recursion.
             match meta.kind {
+                "plan" => {
+                    if let Some((dirty, total, uptodate)) = parse_plan_meta(meta.msg) {
+                        progress.set_plan_totals(dirty, total, uptodate);
+                    }
+                    // Hide in pretty mode; pass-through in raw mode.
+                    if !pretty {
+                        writeln!(out, "{}", line)?;
+                    }
+                }
                 "done" => {
                     if let Some((rv, name)) = meta.msg.split_once(' ') {
+                        let rv_i = rv.parse::<i32>().unwrap_or(0);
+                        let key = abs_key(topdir, mydir, name);
+                        progress.note_done(key, rv_i);
+
                         let rel = state::relpath(&topdir.join(mydir).join(name), topdir);
                         let relname = rel.to_string_lossy().to_string();
                         if pretty {
-                            let rv_i = rv.parse::<i32>().unwrap_or(0);
                             if rv_i != 0 {
                                 write_pretty_line(
                                     out,
@@ -374,6 +504,15 @@ fn catlog_stdin(
                     let fixname = normalize(child.clone());
                     let rel = state::relpath(&topdir.join(&child), topdir);
                     let relname = rel.to_string_lossy().to_string();
+
+                    // Progress accounting.
+                    let key = abs_key(topdir, mydir, meta.msg);
+                    match meta.kind {
+                        "do" => progress.note_started(key),
+                        "locked" => progress.note_running(key),
+                        "waiting" | "unlocked" => progress.note_seen(key),
+                        _ => {}
+                    }
 
                     if pretty {
                         if debug_locks && meta.kind != "do" {
@@ -409,6 +548,7 @@ fn catlog_stdin(
                             status,
                             start,
                             total_lines,
+                            progress,
                             already,
                             out,
                         )?;
@@ -416,6 +556,13 @@ fn catlog_stdin(
                     already.insert(fixname);
                 }
                 "unchanged" => {
+                    let key = abs_key(topdir, mydir, meta.msg);
+                    if progress.has_dirty_plan() {
+                        progress.note_uptodate(key);
+                    } else {
+                        progress.note_unchanged(key);
+                    }
+
                     if unchanged {
                         let child = mydir.join(meta.msg);
                         let fixname = normalize(child.clone());
@@ -456,6 +603,7 @@ fn catlog_stdin(
                                 status,
                                 start,
                                 total_lines,
+                                progress,
                                 already,
                                 out,
                             )?;
@@ -518,7 +666,7 @@ fn catlog_stdin(
         }
 
         if follow {
-            if maybe_print_status(status, start, &mut last_status, *total_lines, top_arg)? {
+            if maybe_print_status(status, start, &mut last_status, *total_lines, top_arg, progress)? {
                 status_active = true;
             }
         }
@@ -553,6 +701,7 @@ fn catlog(
     status: i32,
     start: Instant,
     total_lines: &mut u64,
+    progress: &mut Progress,
     already: &mut HashSet<String>,
     out: &mut dyn Write,
 ) -> anyhow::Result<()> {
@@ -580,7 +729,7 @@ fn catlog(
         match state::File::by_name(t, false) {
             Ok(f) => break f,
             Err(_) if follow && follow_grace_start.elapsed() < FOLLOW_START_GRACE => {
-                let _ = maybe_print_status(status, start, &mut last_status, *total_lines, top_arg);
+                let _ = maybe_print_status(status, start, &mut last_status, *total_lines, top_arg, progress);
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
@@ -612,7 +761,7 @@ fn catlog(
                 if !follow {
                     return Ok(());
                 }
-                if maybe_print_status(status, start, &mut last_status, *total_lines, top_arg)? {
+                if maybe_print_status(status, start, &mut last_status, *total_lines, top_arg, progress)? {
                     status_active = true;
                 }
                 let locked = is_locked(f.id)?;
@@ -642,7 +791,7 @@ fn catlog(
                 break;
             }
             // follow: keep going until target lock is released
-            if maybe_print_status(status, start, &mut last_status, *total_lines, top_arg)? {
+            if maybe_print_status(status, start, &mut last_status, *total_lines, top_arg, progress)? {
                 status_active = true;
             }
             let locked = is_locked(f.id)?;
@@ -676,12 +825,23 @@ fn catlog(
             }
 
             match meta.kind {
+                "plan" => {
+                    if let Some((dirty, total, uptodate)) = parse_plan_meta(meta.msg) {
+                        progress.set_plan_totals(dirty, total, uptodate);
+                    }
+                    if !pretty {
+                        writeln!(out, "{}", line)?;
+                    }
+                }
                 "done" => {
                     if let Some((rv, name)) = meta.msg.split_once(' ') {
+                        let rv_i = rv.parse::<i32>().unwrap_or(0);
+                        let key = abs_key(topdir, mydir, name);
+                        progress.note_done(key, rv_i);
+
                         let rel = state::relpath(&topdir.join(mydir).join(name), topdir);
                         let relname = rel.to_string_lossy().to_string();
                         if pretty {
-                            let rv_i = rv.parse::<i32>().unwrap_or(0);
                             if rv_i != 0 {
                                 write_pretty_line(
                                     out,
@@ -715,6 +875,15 @@ fn catlog(
                     let fixname = normalize(child.clone());
                     let rel = state::relpath(&topdir.join(&child), topdir);
                     let relname = rel.to_string_lossy().to_string();
+
+                    // Progress accounting.
+                    let key = abs_key(topdir, mydir, meta.msg);
+                    match meta.kind {
+                        "do" => progress.note_started(key),
+                        "locked" => progress.note_running(key),
+                        "waiting" | "unlocked" => progress.note_seen(key),
+                        _ => {}
+                    }
 
                     if pretty {
                         if debug_locks && meta.kind != "do" {
@@ -752,6 +921,7 @@ fn catlog(
                             status,
                             start,
                             total_lines,
+                            progress,
                             already,
                             out,
                         )?;
@@ -760,6 +930,13 @@ fn catlog(
                     already.insert(fixname);
                 }
                 "unchanged" => {
+                    let key = abs_key(topdir, mydir, meta.msg);
+                    if progress.has_dirty_plan() {
+                        progress.note_uptodate(key);
+                    } else {
+                        progress.note_unchanged(key);
+                    }
+
                     if unchanged {
                         let child = mydir.join(meta.msg);
                         let fixname = normalize(child.clone());
@@ -801,6 +978,7 @@ fn catlog(
                                 status,
                                 start,
                                 total_lines,
+                                progress,
                                 already,
                                 out,
                             )?;
@@ -920,6 +1098,7 @@ fn maybe_print_status(
     last_status: &mut Instant,
     total_lines: u64,
     top_arg: &str,
+    progress: &Progress,
 ) -> anyhow::Result<bool> {
     if status <= 0 {
         return Ok(false);
@@ -937,10 +1116,343 @@ fn maybe_print_status(
     }
     *last_status = Instant::now();
     let mut err = std::io::stderr();
-    // Keep it simple; tests only assert that some "redo " status appears.
-    write!(err, "\rredo {} {}\r", total_lines, top_arg)?;
+    let (seen, running, done, failed) = progress.counts();
+    let (started2, done2, running2, failed2) = if let Some(plan) = &progress.planned_steps {
+        let done_p = progress.done.iter().filter(|k| plan.contains(*k)).count();
+        let running_p = progress
+            .running
+            .iter()
+            .filter(|k| plan.contains(*k))
+            .count();
+        let failed_p = progress.failed.iter().filter(|k| plan.contains(*k)).count();
+        let started_p = done_p + running_p;
+        (started_p, done_p, running_p, failed_p)
+    } else {
+        let started = done + running;
+        (started, done, running, failed)
+    };
+    let dirty_total = progress.plan_dirty_total;
+    let plan_total = progress.plan_total;
+    let plan_uptodate_total = progress.plan_uptodate_total;
+    let elapsed = start.elapsed();
+    let secs = elapsed.as_secs();
+    let mins = secs / 60;
+    let sec2 = secs % 60;
+    let t = if mins > 0 {
+        format!("{mins}:{sec2:02}")
+    } else {
+        format!("{secs}s")
+    };
+    // Include the old `total_lines` counter so there is always visible motion,
+    // even when progress meta-lines are sparse.
+    let suffix = if top_arg != "-" && !top_arg.is_empty() {
+        format!(" {}", top_arg)
+    } else {
+        String::new()
+    };
+    if let Some(dirty) = dirty_total {
+        let mut denom = dirty;
+        let mut discovered: usize = 0;
+        if started2 > denom {
+            discovered = started2 - denom;
+            denom = started2;
+        }
+        let upd = plan_uptodate_total.unwrap_or(0);
+        let tot = plan_total.unwrap_or_else(|| denom + upd);
+        let disc_suffix = if discovered > 0 {
+            format!(", +{discovered} discovered")
+        } else {
+            String::new()
+        };
+        write!(
+            err,
+            "\rredo {started2}/{denom} steps ({done2} done), {running2} running, {failed2} failed, {upd} up-to-date ({}) [{} lines]{}{}\r",
+            t,
+            total_lines,
+            suffix,
+            disc_suffix
+        )?;
+        let _ = tot; // kept for potential future UI tweaks
+    } else if let Some(plan) = &progress.planned_steps {
+        let total = plan.len();
+        write!(
+            err,
+            "\rredo {started2}/{total} steps ({done2} done), {running2} running, {failed2} failed ({}) [{} lines]{}\r",
+            t,
+            total_lines,
+            suffix
+        )?;
+    } else {
+        write!(
+            err,
+            "\rredo {started2}/{seen} started ({done2} done), {running2} running, {failed2} failed ({}) [{} lines]{}\r",
+            t,
+            total_lines,
+            suffix
+        )?;
+    }
     err.flush()?;
     Ok(true)
+}
+
+fn parse_plan_meta(msg: &str) -> Option<(usize, usize, usize)> {
+    // Accept: "dirty=N total=M uptodate=K" (order-insensitive; may contain extras).
+    let mut dirty: Option<usize> = None;
+    let mut total: Option<usize> = None;
+    let mut uptodate: Option<usize> = None;
+    for w in msg.split_whitespace() {
+        let Some((k, v)) = w.split_once('=') else { continue; };
+        match k {
+            "dirty" => dirty = v.parse::<usize>().ok(),
+            "total" => total = v.parse::<usize>().ok(),
+            "uptodate" => uptodate = v.parse::<usize>().ok(),
+            _ => {}
+        }
+    }
+    Some((dirty?, total?, uptodate?))
+}
+
+fn compute_plan_scope(base: &Path, plan_all: &HashSet<String>, roots: &[String]) -> HashSet<String> {
+    // Best-effort: parse `redo-ifchange` lines from generated .do scripts
+    // to compute the closure of planned outputs reachable from roots.
+    //
+    // This is intentionally conservative:
+    // - it only follows dependencies that are also in `plan_all`
+    // - it ignores dynamic forms like `--from-file` or `$var` arguments
+    //
+    // If anything looks odd, fall back to the full plan (better stable than wrong-small).
+    let mut root_keys: Vec<String> = Vec::new();
+    for r in roots {
+        let p = Path::new(r);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        };
+        let k = normalize(abs);
+        if plan_all.contains(&k) {
+            root_keys.push(k);
+        }
+    }
+    if root_keys.is_empty() {
+        return plan_all.clone();
+    }
+
+    let mut scope: HashSet<String> = HashSet::new();
+    let mut q: VecDeque<String> = VecDeque::new();
+    for k in root_keys {
+        if scope.insert(k.clone()) {
+            q.push_back(k);
+        }
+    }
+
+    // Guardrail: if the closure gets large, stop trying to be clever.
+    // This keeps redo-log startup responsive for big builds.
+    //
+    // Note: we cap the walk well below `plan_all.len()` for large plans because
+    // walking thousands of .do files can noticeably delay redo-log startup, and
+    // in that regime using the full plan is usually "good enough".
+    let max_scope = std::cmp::min(plan_all.len(), 4096usize);
+
+    while let Some(k) = q.pop_front() {
+        if scope.len() >= max_scope {
+            return plan_all.clone();
+        }
+        let deps = deps_from_dofile(base, &k);
+        for d in deps {
+            let dk = if Path::new(&d).is_absolute() {
+                normalize(PathBuf::from(&d))
+            } else {
+                normalize(base.join(&d))
+            };
+            if !plan_all.contains(&dk) {
+                continue;
+            }
+            if scope.insert(dk.clone()) {
+                q.push_back(dk);
+            }
+        }
+    }
+    scope
+}
+
+fn deps_from_dofile(base: &Path, output_key: &str) -> Vec<String> {
+    let mut deps: Vec<String> = Vec::new();
+    let do_path = PathBuf::from(format!("{}.do", output_key));
+    let f = match File::open(&do_path) {
+        Ok(f) => f,
+        Err(_) => return deps,
+    };
+    let mut r = BufReader::new(f);
+    let mut line = String::new();
+
+    // Avoid parsing non-generated scripts too aggressively.
+    // CMake's Redo generator emits a stable header line we can key off.
+    let mut first = String::new();
+    if r.read_line(&mut first).is_ok() {
+        if !first.contains("Generated by CMake Redo generator") {
+            return deps;
+        }
+    }
+
+    loop {
+        line.clear();
+        let n = match r.read_line(&mut line) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let s = line.trim_start();
+        if !s.starts_with("redo-ifchange") {
+            continue;
+        }
+        for d in parse_redo_ifchange_deps(s) {
+            // Only keep deps that look like paths; ignore obvious shell expansions.
+            if d.contains('$') || d.contains('`') {
+                continue;
+            }
+            // Strip a leading base prefix back to relative when possible.
+            // This keeps the returned deps consistent with plan.targets entries.
+            let p = Path::new(&d);
+            if p.is_absolute() {
+                if let Ok(rel) = p.strip_prefix(base) {
+                    deps.push(rel.to_string_lossy().to_string());
+                    continue;
+                }
+            }
+            deps.push(d);
+        }
+    }
+    deps
+}
+
+fn parse_redo_ifchange_deps(line: &str) -> Vec<String> {
+    // Best-effort shell-ish word splitting for generated scripts.
+    // Supports:
+    // - single quotes: '...'
+    // - double quotes: "..." with backslash escapes
+    // - backslash escapes outside quotes
+    let mut s = line.trim_start();
+    if !s.starts_with("redo-ifchange") {
+        return Vec::new();
+    }
+    s = &s["redo-ifchange".len()..];
+
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+    }
+
+    let bytes = s.as_bytes();
+    let mut i: usize = 0;
+    let mut words: Vec<String> = Vec::new();
+    while i < bytes.len() {
+        while i < bytes.len() && is_ws(bytes[i]) {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'#' {
+            break;
+        }
+        let mut w = String::new();
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    w.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'\'' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' if i + 1 < bytes.len() => {
+                            i += 1;
+                            w.push(bytes[i] as char);
+                            i += 1;
+                        }
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        c => {
+                            w.push(c as char);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            _ => {
+                while i < bytes.len() && !is_ws(bytes[i]) {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 1;
+                        w.push(bytes[i] as char);
+                        i += 1;
+                        continue;
+                    }
+                    w.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+        }
+        if !w.is_empty() {
+            words.push(w);
+        }
+    }
+
+    let mut deps: Vec<String> = Vec::new();
+    let mut j: usize = 0;
+    while j < words.len() {
+        let w = &words[j];
+        if w == "--from-file" || w == "--from-file0" {
+            // skip the filename arg
+            j = std::cmp::min(j + 2, words.len());
+            continue;
+        }
+        if w.starts_with('-') {
+            j += 1;
+            continue;
+        }
+        deps.push(w.clone());
+        j += 1;
+    }
+    deps
+}
+
+fn load_plan_targets(base: &Path) -> Option<HashSet<String>> {
+    let plan_path = base.join(".redo").join("plan.targets");
+    let f = File::open(&plan_path).ok()?;
+    let mut r = BufReader::new(f);
+    let mut out: HashSet<String> = HashSet::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = r.read_line(&mut line).ok()?;
+        if n == 0 {
+            break;
+        }
+        let s = line
+            .trim_end_matches(|c| c == '\n' || c == '\r')
+            .trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        let p = Path::new(s);
+        let abs = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        };
+        out.insert(normalize(abs));
+    }
+    Some(out)
 }
 
 fn normalize(p: PathBuf) -> String {

@@ -37,6 +37,15 @@ Run unit tests + the repo’s self-contained integration tests:
 bash scripts/run_tests.sh
 ```
 
+## Bulk dependency inputs (redo-ifchange)
+
+When a tool produces a dependency list that can’t be safely shell-split (e.g. paths
+with spaces), `redo-ifchange` can read targets from a file (or stdin) and treat
+them exactly like positional arguments:
+
+- `redo-ifchange --from-file <path>`: newline-separated targets (`-` = stdin)
+- `redo-ifchange --from-file0 <path>`: NUL-separated targets (`-` = stdin)
+
 ### Optional: vendored integration tests (Apache-2.0)
 
 This repo includes an Apache-2.0-licensed integration test suite under `third_party/python_redo_tests/`.

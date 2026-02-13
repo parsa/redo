@@ -284,6 +284,134 @@ fn find_do_for_target(sf: &state::File) -> anyhow::Result<Option<(PathBuf, Strin
     Ok(None)
 }
 
+#[derive(Debug, Clone)]
+struct PoolSpec {
+    name: String,
+    depth: usize,
+}
+
+// Pool slot lock fid mapping.
+//
+// We map `poolName -> base fid` using a stable hash and then use
+// `base+slotIndex` for each slot.
+//
+// This intentionally lives in a fid range far away from normal file ids and
+// log-lock fids, to avoid collisions.
+const POOL_LOCK_MAGIC: i64 = 0x2000_0000;
+const POOL_LOCK_STRIDE: i64 = 1 << 16; // supports depths up to 65536
+
+fn fnv1a64(s: &str) -> u64 {
+    // Stable non-crypto hash.
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+fn pool_slot_fid(name: &str, slot: usize) -> anyhow::Result<i64> {
+    if slot as i64 >= POOL_LOCK_STRIDE {
+        anyhow::bail!(
+            "pool depth too large: slot={} (max={})",
+            slot,
+            POOL_LOCK_STRIDE - 1
+        );
+    }
+    // Use 32 bits of hash as a bucket. Collision probability is ~1/2^32.
+    let bucket = (fnv1a64(name) & 0xffff_ffff) as i64;
+    Ok(POOL_LOCK_MAGIC + bucket.saturating_mul(POOL_LOCK_STRIDE) + slot as i64)
+}
+
+fn parse_redo_pool_directive(dodir: &Path, dofile: &str) -> anyhow::Result<Option<PoolSpec>> {
+    let p = dodir.join(dofile);
+    let f = fs::File::open(&p)?;
+    // Read a small prefix; directives must appear at the top of the file.
+    let mut s = String::new();
+    let mut limited = f.take(16 * 1024);
+    limited.read_to_string(&mut s)?;
+
+    for line in s.lines().take(64) {
+        let l = line.trim_start();
+        let Some(rest) = l.strip_prefix('#') else { continue; };
+        let rest = rest.trim_start();
+        let Some(rest) = rest.strip_prefix("redo-pool:") else { continue; };
+        let mut it = rest.split_whitespace();
+        let name = it
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("invalid redo pool directive in {:?}: missing name", p))?
+            .to_string();
+        let depth_s = it.next().ok_or_else(|| {
+            anyhow::anyhow!("invalid redo pool directive in {:?}: missing depth", p)
+        })?;
+        let depth = depth_s.parse::<usize>().map_err(|e| {
+            anyhow::anyhow!(
+                "invalid redo pool directive in {:?}: bad depth {:?}: {}",
+                p,
+                depth_s,
+                e
+            )
+        })?;
+        if depth == 0 {
+            anyhow::bail!("invalid redo pool directive in {:?}: depth must be > 0", p);
+        }
+        if depth as i64 > POOL_LOCK_STRIDE {
+            anyhow::bail!(
+                "invalid redo pool directive in {:?}: depth {} exceeds max {}",
+                p,
+                depth,
+                POOL_LOCK_STRIDE
+            );
+        }
+        return Ok(Some(PoolSpec { name, depth }));
+    }
+    Ok(None)
+}
+
+fn try_acquire_pool(spec: &PoolSpec) -> anyhow::Result<Option<state::Lock>> {
+    for slot in 0..spec.depth {
+        let fid = pool_slot_fid(&spec.name, slot)?;
+        let mut l = match state::Lock::new(fid) {
+            Ok(l) => l,
+            Err(e) => {
+                // If we already created a lock object for this fid in this process
+                // (eg. another scheduled job is currently holding the pool slot),
+                // treat it as unavailable.
+                if e.to_string().starts_with("Lock already created for fid=") {
+                    continue;
+                }
+                return Err(e);
+            }
+        };
+        if l.trylock()? {
+            return Ok(Some(l));
+        }
+        // Drop `l` (releasing local bookkeeping) and try next slot.
+    }
+    Ok(None)
+}
+
+fn find_do_for_target_no_deps(
+    sf: &state::File,
+) -> anyhow::Result<Option<(PathBuf, String, String, String)>> {
+    // Like `find_do_for_target`, but does not record dependencies or mutate state.
+    // This is used to read metadata directives (eg. job pools) without opening
+    // sqlite write transactions while waiting.
+    let base = env::v().base;
+    for cand in paths::possible_do_files(&sf.name, &base) {
+        let dopath = cand.dodir.join(&cand.dofile);
+        if dopath.exists() {
+            return Ok(Some((
+                cand.dodir,
+                cand.dofile,
+                cand.basename.clone(),
+                cand.ext.clone(),
+            )));
+        }
+    }
+    Ok(None)
+}
+
 struct PendingBuild {
     t: String,
     trp: String,
@@ -293,7 +421,14 @@ struct PendingBuild {
     before_t: Option<std::fs::Metadata>,
     dofile: String,
     sf: state::File,
+    pool_lock: Option<state::Lock>,
     lock: Option<state::Lock>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleBuildOneResult {
+    Scheduled,
+    DeferredPool,
 }
 
 fn schedule_build_one(
@@ -301,7 +436,7 @@ fn schedule_build_one(
     mut sf: state::File,
     mut lock: Option<state::Lock>,
     rc_flag: Arc<AtomicI32>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ScheduleBuildOneResult> {
     let abs_target = env::v().base.join(&sf.name);
 
     let trp = state::target_relpath(&abs_target).to_string_lossy().to_string();
@@ -327,7 +462,7 @@ fn schedule_build_one(
             l.unlock()?;
         }
         Log::meta("done", &format!("0 {}", sf.name), None);
-        return Ok(());
+        return Ok(ScheduleBuildOneResult::Scheduled);
     }
 
     // If target exists and is not generated, treat as static and skip.
@@ -339,7 +474,27 @@ fn schedule_build_one(
             l.unlock()?;
         }
         Log::meta("done", &format!("0 {}", trp), None);
-        return Ok(());
+        return Ok(ScheduleBuildOneResult::Scheduled);
+    }
+
+    // Pool scheduling: acquire a slot *before* we mutate sqlite state.
+    // This avoids holding write transactions open when we have to wait for pool
+    // availability.
+    let mut pool_lock: Option<state::Lock> = None;
+    if let Some((dodir0, dofile0, _, _)) = find_do_for_target_no_deps(&sf)? {
+        if let Some(spec) = parse_redo_pool_directive(&dodir0, &dofile0)? {
+            match try_acquire_pool(&spec)? {
+                Some(l) => {
+                    pool_lock = Some(l);
+                }
+                None => {
+                    if let Some(l) = lock.as_mut() {
+                        l.unlock()?;
+                    }
+                    return Ok(ScheduleBuildOneResult::DeferredPool);
+                }
+            }
+        }
     }
 
     // If we're about to build a missing file, persist the "this is a target" decision
@@ -358,7 +513,7 @@ fn schedule_build_one(
                 l.unlock()?;
             }
             Log::meta("done", &format!("0 {}", trp), None);
-            return Ok(());
+            return Ok(ScheduleBuildOneResult::Scheduled);
         }
         Log::err(&format!("no rule to redo {:?}", t));
         sf.set_failed()?;
@@ -369,7 +524,7 @@ fn schedule_build_one(
         }
         Log::meta("done", &format!("1 {}", trp), None);
         rc_flag.store(1, Ordering::Relaxed);
-        return Ok(());
+        return Ok(ScheduleBuildOneResult::Scheduled);
     };
 
     // Args are expressed relative to the .do file directory.
@@ -396,6 +551,7 @@ fn schedule_build_one(
         before_t,
         dofile: dofile.clone(),
         sf: sf.clone(),
+        pool_lock,
         lock,
     };
     let pb = Arc::new(Mutex::new(pb));
@@ -417,6 +573,9 @@ fn schedule_build_one(
         move || exec_dofile_in_child(&dodir2, &dofile2, &arg1_2, &arg2_2, &arg3_2, outfd, lock_fid),
         move |_name, rv| {
             let mut pb = pb2.lock().unwrap();
+
+            // Job is no longer running; release any pool slot promptly.
+            pb.pool_lock = None;
 
             // Parent: examine outputs.
             let after_t = try_lstat(&pb.abs_target).unwrap_or(None);
@@ -527,7 +686,7 @@ fn schedule_build_one(
         },
     )?;
 
-    Ok(())
+    Ok(ScheduleBuildOneResult::Scheduled)
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +831,35 @@ fn build_one(t: &str) -> anyhow::Result<i32> {
             l.unlock()?;
         }
         return Ok(1);
+    };
+
+    // Pool scheduling (blocking path): wait for a slot *without* holding a jobserver
+    // token (we only need a token when we actually start the .do script).
+    //
+    // Note: this can still be invoked inside parallel builds (eg. `redo -jN a b`),
+    // so we release our token while waiting to avoid starving unrelated work.
+    let _pool_lock = match parse_redo_pool_directive(&dodir, &dofile)? {
+        Some(spec) => {
+            // Flush any sqlite writes before we might block.
+            state::commit()?;
+            let mut backoff_ms: u64 = 10;
+            let mut released = false;
+            loop {
+                if let Some(l) = try_acquire_pool(&spec)? {
+                    break Some(l);
+                }
+                if !released {
+                    let _ = jobserver::release_mine();
+                    released = true;
+                }
+                Log::meta("waiting", &trp, None);
+                std::thread::sleep(std::time::Duration::from_millis(std::cmp::min(
+                    backoff_ms, 1000,
+                )));
+                backoff_ms = std::cmp::min(backoff_ms * 2, 1000);
+            }
+        }
+        None => None,
     };
 
     // Args are expressed relative to the .do file directory.
@@ -1039,6 +1227,7 @@ pub fn run_ifchange(targets: &[String]) -> anyhow::Result<i32> {
 
     let rc_flag = Arc::new(AtomicI32::new(0));
     let mut locked: Vec<LockedTarget> = Vec::new();
+    let mut pool_blocked: Vec<LockedTarget> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // First pass: trylock everything we can; don't block on locked targets.
@@ -1115,7 +1304,23 @@ pub fn run_ifchange(targets: &[String]) -> anyhow::Result<i32> {
                         start_redo_unlocked_job(t, args, lock, rc_flag.clone())?;
                     }
                     _ => {
-                        schedule_build_one(t, f, Some(lock), rc_flag.clone())?;
+                        let fid = f.id;
+                        let name = f.name.clone();
+                        match schedule_build_one(t, f, Some(lock), rc_flag.clone())? {
+                            ScheduleBuildOneResult::DeferredPool => {
+                                let abs = env::v().base.join(&name);
+                                let trp = state::target_relpath(&abs).to_string_lossy().to_string();
+                                Log::meta("waiting", &trp, None);
+                                pool_blocked.push(LockedTarget {
+                                    fid,
+                                    t_arg: t.clone(),
+                                    name,
+                                });
+                                // We acquired a token but did not start a job; release it.
+                                let _ = jobserver::release_mine();
+                            }
+                            ScheduleBuildOneResult::Scheduled => {}
+                        }
                     }
                 }
             }
@@ -1132,7 +1337,8 @@ pub fn run_ifchange(targets: &[String]) -> anyhow::Result<i32> {
     }
 
     // Second pass: wait for remaining locks one-by-one, releasing our token while blocking.
-    while !locked.is_empty() || jobserver::running() {
+    let mut pool_backoff_ms: u64 = 10;
+    while !locked.is_empty() || !pool_blocked.is_empty() || jobserver::running() {
         state::commit()?;
         jobserver::wait_all()?;
 
@@ -1140,12 +1346,97 @@ pub fn run_ifchange(targets: &[String]) -> anyhow::Result<i32> {
         if rc_flag.load(Ordering::Relaxed) != 0 && !env::v().keep_going {
             break;
         }
-        if locked.is_empty() {
+        if locked.is_empty() && pool_blocked.is_empty() {
             continue;
         }
         if !state::check_sane() {
             Log::err(".redo directory disappeared; cannot continue.");
             return Ok(205);
+        }
+
+        // Prefer resolving target lock contention first.
+        if locked.is_empty() {
+            let lt = pool_blocked.remove(0);
+            let abs = env::v().base.join(&lt.name);
+            let trp = state::target_relpath(&abs).to_string_lossy().to_string();
+
+            // Someone else may have started building this target since we deferred it.
+            let mut lock = state::Lock::new(lt.fid)?;
+            match lock.trylock()? {
+                false => {
+                    Log::meta("locked", &trp, None);
+                    locked.push(lt);
+                }
+                true => {
+                    let fcheck = state::File::by_name(&lt.t_arg, true)?;
+                    if fcheck.is_failed() {
+                        Log::err(&format!("{}: failed in another thread", lt.name));
+                        rc_flag.store(2, Ordering::Relaxed);
+                        lock.unlock()?;
+                    } else {
+                        let mut f = state::File::by_name(&lt.t_arg, true)?;
+                        f.refresh()?;
+                        let runid = env::v().runid.unwrap_or(0);
+                        let dirty = deps::isdirty_default(&mut f, runid)?;
+                        match dirty {
+                            deps::DirtyResult::Clean => {
+                                if f.is_generated {
+                                    Log::meta("unchanged", &trp, None);
+                                }
+                                lock.unlock()?;
+                                pool_backoff_ms = 10;
+                            }
+                            deps::DirtyResult::MustBuild(list)
+                                if !env::v().no_oob && !(list.len() == 1 && list[0].id == f.id) =>
+                            {
+                                Log::meta("check", &trp, None);
+                                let cwd = std::env::current_dir()?;
+                                let base = env::v().base;
+                                let fix = |p: &str| {
+                                    state::relpath(&base.join(p), &cwd)
+                                        .to_string_lossy()
+                                        .to_string()
+                                };
+                                let mut args: Vec<String> = Vec::new();
+                                args.push(fix(&f.name));
+                                for d in list {
+                                    if d.id != f.id {
+                                        args.push(fix(&d.name));
+                                    }
+                                }
+                                start_redo_unlocked_job(&lt.t_arg, args, lock, rc_flag.clone())?;
+                                pool_backoff_ms = 10;
+                            }
+                            _ => {
+                                let fid = f.id;
+                                let name = f.name.clone();
+                                match schedule_build_one(&lt.t_arg, f, Some(lock), rc_flag.clone())? {
+                                    ScheduleBuildOneResult::DeferredPool => {
+                                        Log::meta("waiting", &trp, None);
+                                        pool_blocked.push(LockedTarget {
+                                            fid,
+                                            t_arg: lt.t_arg,
+                                            name,
+                                        });
+                                        // Critical: avoid holding an open sqlite write transaction
+                                        // while we back off waiting for a pool slot.
+                                        state::commit()?;
+                                        let _ = jobserver::release_mine();
+                                        std::thread::sleep(std::time::Duration::from_millis(
+                                            std::cmp::min(pool_backoff_ms, 1000),
+                                        ));
+                                        pool_backoff_ms = std::cmp::min(pool_backoff_ms * 2, 1000);
+                                    }
+                                    ScheduleBuildOneResult::Scheduled => {
+                                        pool_backoff_ms = 10;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
         }
 
         let lt = locked.remove(0);
@@ -1221,7 +1512,20 @@ pub fn run_ifchange(targets: &[String]) -> anyhow::Result<i32> {
                 start_redo_unlocked_job(&lt.t_arg, args, lock, rc_flag.clone())?;
             }
             _ => {
-                schedule_build_one(&lt.t_arg, f, Some(lock), rc_flag.clone())?;
+                let fid = f.id;
+                let name = f.name.clone();
+                match schedule_build_one(&lt.t_arg, f, Some(lock), rc_flag.clone())? {
+                    ScheduleBuildOneResult::DeferredPool => {
+                        Log::meta("waiting", &trp, None);
+                        pool_blocked.push(LockedTarget {
+                            fid,
+                            t_arg: lt.t_arg,
+                            name,
+                        });
+                        let _ = jobserver::release_mine();
+                    }
+                    ScheduleBuildOneResult::Scheduled => {}
+                }
             }
         }
     }

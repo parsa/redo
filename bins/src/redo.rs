@@ -1,10 +1,16 @@
 use std::ffi::CString;
 
 use redo_core::builder;
+use redo_core::deps;
 use redo_core::{env, helpers, state};
 use redo_core::logs;
+use redo_core::logs::Log;
 use redo_core::version::TAG;
 
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -346,6 +352,15 @@ fn main() {
             close_stdin();
         }
         if env::v().log != 0 {
+            // Tell redo-log which top-level targets were requested.
+            // This is used for best-effort progress planning/estimation.
+            let log_roots: Vec<String> = if targets.is_empty() {
+                vec!["all".to_string()]
+            } else {
+                targets.clone()
+            };
+            std::env::set_var("REDO_LOG_TOP_TARGETS", log_roots.join("\n"));
+
             // Failing to start redo-log is fatal.
             if let Err(e) = start_stdin_log_reader(
                 status,
@@ -357,6 +372,27 @@ fn main() {
             ) {
                 eprintln!("failed to start redo-log subprocess; cannot continue: {:?}", e);
                 std::process::exit(99);
+            }
+
+            // Best-effort build plan: compute a Ninja-like dirty-step denominator
+            // for generator-provided plans (eg. CMake -GRedo) and emit it as a
+            // single meta-line that redo-log can use for progress display.
+            if status {
+                if let Ok(Some(plan)) = compute_build_plan(&targets) {
+                    Log::meta(
+                        "plan",
+                        &format!(
+                            "dirty={} total={} uptodate={}",
+                            plan.dirty, plan.total, plan.uptodate
+                        ),
+                        None,
+                    );
+                    // Install the preflight checked set so the actual build can
+                    // avoid re-statting the same clean nodes.
+                    if let Some(ids) = plan.checked_ids {
+                        deps::install_preflight_checked(ids);
+                    }
+                }
             }
         }
     }
@@ -383,4 +419,303 @@ fn main() {
     }
 
     std::process::exit(rv);
+}
+
+#[derive(Debug)]
+struct BuildPlan {
+    dirty: usize,
+    total: usize,
+    uptodate: usize,
+    checked_ids: Option<HashSet<i64>>,
+}
+
+fn compute_build_plan(targets: &[String]) -> anyhow::Result<Option<BuildPlan>> {
+    // Only plan when a generator manifest exists.
+    let base = env::v().base;
+    let plan_targets_path = base.join(".redo").join("plan.targets");
+    if !plan_targets_path.exists() {
+        return Ok(None);
+    }
+
+    let roots: Vec<String> = if targets.is_empty() {
+        vec!["all".to_string()]
+    } else {
+        targets.to_vec()
+    };
+
+    let plan_all = load_plan_targets(&base, &plan_targets_path)?;
+    if plan_all.is_empty() {
+        return Ok(None);
+    }
+
+    let scope = compute_plan_scope(&base, &plan_all, &roots);
+    if scope.is_empty() {
+        return Ok(None);
+    }
+
+    let runid = env::v().runid.unwrap_or(0);
+    let mut cache = deps::PlanCache::default();
+    let mut dirty: usize = 0;
+    let mut uptodate: usize = 0;
+
+    for out_rel in &scope {
+        let abs = base.join(out_rel);
+        let abs_s = abs.to_string_lossy();
+        let mut f = match state::File::by_name(abs_s.as_ref(), false) {
+            Ok(f) => f,
+            Err(_) => {
+                // Unknown file -> treat as dirty (likely first build / not yet recorded).
+                dirty += 1;
+                continue;
+            }
+        };
+        match deps::isdirty_readonly_default(&mut f, runid, &mut cache)? {
+            deps::DirtyResult::Clean => uptodate += 1,
+            deps::DirtyResult::Dirty | deps::DirtyResult::MustBuild(_) => dirty += 1,
+        }
+    }
+
+    let total = scope.len();
+    let checked_ids = cache.take_checked_ids();
+    Ok(Some(BuildPlan {
+        dirty,
+        total,
+        uptodate,
+        checked_ids: Some(checked_ids),
+    }))
+}
+
+fn load_plan_targets(base: &Path, plan_path: &Path) -> anyhow::Result<HashSet<String>> {
+    let f = File::open(plan_path)?;
+    let mut r = BufReader::new(f);
+    let mut out: HashSet<String> = HashSet::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = r.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        let s = line.trim_end_matches(|c| c == '\n' || c == '\r').trim();
+        if s.is_empty() || s.starts_with('#') {
+            continue;
+        }
+        // Normalize absolute paths to base-relative when possible.
+        let p = Path::new(s);
+        if p.is_absolute() {
+            if let Ok(rel) = p.strip_prefix(base) {
+                out.insert(rel.to_string_lossy().to_string());
+                continue;
+            }
+        }
+        out.insert(s.to_string());
+    }
+    Ok(out)
+}
+
+fn compute_plan_scope(base: &Path, plan_all: &HashSet<String>, roots: &[String]) -> HashSet<String> {
+    // Parse generated .do files and follow dependencies that are also in plan_all.
+    // This is best-effort and intentionally conservative.
+    let mut root_keys: Vec<String> = Vec::new();
+    for r in roots {
+        let s = r.trim();
+        if s.is_empty() {
+            continue;
+        }
+        let p = Path::new(s);
+        let rel = if p.is_absolute() {
+            p.strip_prefix(base)
+                .ok()
+                .map(|rp| rp.to_string_lossy().to_string())
+        } else {
+            Some(s.to_string())
+        };
+        let Some(rel) = rel else { continue; };
+        if plan_all.contains(&rel) {
+            root_keys.push(rel);
+        }
+    }
+    if root_keys.is_empty() {
+        return HashSet::new();
+    }
+
+    let mut scope: HashSet<String> = HashSet::new();
+    let mut q: VecDeque<String> = VecDeque::new();
+    for k in root_keys {
+        if scope.insert(k.clone()) {
+            q.push_back(k);
+        }
+    }
+
+    let mut adj: HashMap<String, Vec<String>> = HashMap::new();
+    while let Some(k) = q.pop_front() {
+        let deps = if let Some(v) = adj.get(&k) {
+            v.clone()
+        } else {
+            let v = deps_from_dofile(base, &k, plan_all);
+            adj.insert(k.clone(), v.clone());
+            v
+        };
+        for d in deps {
+            if !plan_all.contains(&d) {
+                continue;
+            }
+            if scope.insert(d.clone()) {
+                q.push_back(d);
+            }
+        }
+    }
+    scope
+}
+
+fn deps_from_dofile(base: &Path, output_rel: &str, plan_all: &HashSet<String>) -> Vec<String> {
+    let mut deps: Vec<String> = Vec::new();
+    let do_path = base.join(format!("{output_rel}.do"));
+    let f = match File::open(&do_path) {
+        Ok(f) => f,
+        Err(_) => return deps,
+    };
+    let mut r = BufReader::new(f);
+
+    // Trust-but-verify: only parse generated scripts.
+    let mut first = String::new();
+    if r.read_line(&mut first).is_ok() {
+        if !first.contains("Generated by CMake Redo generator") {
+            return deps;
+        }
+    }
+
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let n = match r.read_line(&mut line) {
+            Ok(n) => n,
+            Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+        let s = line.trim_start();
+        if !s.starts_with("redo-ifchange") {
+            continue;
+        }
+        for d in parse_redo_ifchange_deps(s) {
+            if d.contains('$') || d.contains('`') {
+                continue;
+            }
+            let p = Path::new(&d);
+            let rel = if p.is_absolute() {
+                p.strip_prefix(base)
+                    .ok()
+                    .map(|rp| rp.to_string_lossy().to_string())
+            } else {
+                Some(d.clone())
+            };
+            let Some(rel) = rel else { continue; };
+            if plan_all.contains(&rel) {
+                deps.push(rel);
+            }
+        }
+    }
+    deps.sort();
+    deps.dedup();
+    deps
+}
+
+fn parse_redo_ifchange_deps(line: &str) -> Vec<String> {
+    // Best-effort shell-ish word splitting for generated scripts.
+    // Supports:
+    // - single quotes: '...'
+    // - double quotes: \"...\" with backslash escapes
+    // - backslash escapes outside quotes
+    let mut s = line.trim_start();
+    if !s.starts_with("redo-ifchange") {
+        return Vec::new();
+    }
+    s = &s["redo-ifchange".len()..];
+
+    fn is_ws(b: u8) -> bool {
+        matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+    }
+
+    let bytes = s.as_bytes();
+    let mut i: usize = 0;
+    let mut words: Vec<String> = Vec::new();
+    while i < bytes.len() {
+        while i < bytes.len() && is_ws(bytes[i]) {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'#' {
+            break;
+        }
+        let mut w = String::new();
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != b'\'' {
+                    w.push(bytes[i] as char);
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'\'' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    match bytes[i] {
+                        b'\\' if i + 1 < bytes.len() => {
+                            i += 1;
+                            w.push(bytes[i] as char);
+                            i += 1;
+                        }
+                        b'"' => {
+                            i += 1;
+                            break;
+                        }
+                        c => {
+                            w.push(c as char);
+                            i += 1;
+                        }
+                    }
+                }
+            }
+            _ => {
+                while i < bytes.len() && !is_ws(bytes[i]) {
+                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                        i += 1;
+                        w.push(bytes[i] as char);
+                        i += 1;
+                        continue;
+                    }
+                    w.push(bytes[i] as char);
+                    i += 1;
+                }
+            }
+        }
+        if !w.is_empty() {
+            words.push(w);
+        }
+    }
+
+    let mut deps: Vec<String> = Vec::new();
+    let mut j: usize = 0;
+    while j < words.len() {
+        let w = &words[j];
+        if w == "--from-file" || w == "--from-file0" {
+            // Skip the filename arg.
+            j = std::cmp::min(j + 2, words.len());
+            continue;
+        }
+        if w.starts_with('-') {
+            j += 1;
+            continue;
+        }
+        deps.push(w.clone());
+        j += 1;
+    }
+    deps
 }

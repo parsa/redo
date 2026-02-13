@@ -1,4 +1,6 @@
 use std::ffi::CString;
+use std::io::Read;
+use std::{fs, io};
 use std::sync::{Mutex, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -177,6 +179,75 @@ fn start_stdin_log_reader(
     Ok(())
 }
 
+fn read_depfile_bytes(path: &str) -> anyhow::Result<Vec<u8>> {
+    if path == "-" {
+        let mut buf: Vec<u8> = Vec::new();
+        io::stdin().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(fs::read(path)?)
+    }
+}
+
+fn parse_newline_separated_targets(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for mut line in bytes.split(|&b| b == b'\n') {
+        if let Some(b'\r') = line.last().copied() {
+            line = &line[..line.len() - 1];
+        }
+        if line.is_empty() {
+            continue;
+        }
+        out.push(String::from_utf8(line.to_vec())?);
+    }
+    Ok(out)
+}
+
+fn parse_nul_separated_targets(bytes: &[u8]) -> anyhow::Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in bytes.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        out.push(String::from_utf8(entry.to_vec())?);
+    }
+    Ok(out)
+}
+
+fn parse_targets(args: &[String]) -> anyhow::Result<Vec<String>> {
+    // Minimal option parsing: enough to avoid treating our own flags as targets.
+    let mut targets: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--" {
+            targets.extend(args[i + 1..].iter().cloned());
+            break;
+        }
+        if a == "--from-file" {
+            let path = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--from-file requires a path"))?;
+            let bytes = read_depfile_bytes(path)?;
+            targets.extend(parse_newline_separated_targets(&bytes)?);
+            i += 2;
+            continue;
+        }
+        if a == "--from-file0" {
+            let path = args
+                .get(i + 1)
+                .ok_or_else(|| anyhow::anyhow!("--from-file0 requires a path"))?;
+            let bytes = read_depfile_bytes(path)?;
+            targets.extend(parse_nul_separated_targets(&bytes)?);
+            i += 2;
+            continue;
+        }
+        targets.push(a.clone());
+        i += 1;
+    }
+    Ok(targets)
+}
+
 fn main() {
     let default_panic = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -205,11 +276,19 @@ fn main() {
     });
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
     if args.iter().any(|a| a == "--version") {
         println!("{}", TAG);
         return;
     }
-    let targets = args;
+
+    let targets = match parse_targets(&args) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{:?}", e);
+            std::process::exit(204);
+        }
+    };
 
     // Initialize state so env/base/runid are available before we potentially fork redo-log.
     // Don't ignore errors here: later code assumes env/state are initialized.

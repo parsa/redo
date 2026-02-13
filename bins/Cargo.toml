@@ -10,6 +10,7 @@ redo_core = { path = "../redo_core" }
 sha1.workspace = true
 pathdiff.workspace = true
 libc.workspace = true
+rusqlite.workspace = true
 
 [[bin]]
 name = "redo"
@@ -55,3 +56,6 @@ path = "src/redo_whichdo.rs"
 name = "redo-unlocked"
 path = "src/redo_unlocked.rs"
 
+[[bin]]
+name = "redo-browse"
+path = "src/redo_browse.rs"
