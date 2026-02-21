@@ -31,6 +31,8 @@ pub struct Env {
     pub runid: Option<i64>,
     pub unlocked: bool,
     pub no_oob: bool,
+    pub strict: bool,
+    pub strict_fail: bool,
 }
 
 static IS_TOPLEVEL: AtomicBool = AtomicBool::new(false);
@@ -68,6 +70,8 @@ impl Env {
             runid: env::var("REDO_RUNID").ok().and_then(|s| s.parse().ok()),
             unlocked: get_bool("REDO_UNLOCKED"),
             no_oob: get_bool("REDO_NO_OOB"),
+            strict: get_bool("REDO_STRICT"),
+            strict_fail: get_bool("REDO_STRICT_FAIL"),
         })
     }
 

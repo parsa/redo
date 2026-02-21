@@ -151,6 +151,12 @@ impl Log {
                             pretty_write(pid, cfg().ansi.green, msg);
                         }
                     }
+                    "cache_hit" | "cache_miss" | "cache_store" | "cache_skip" | "cache_stats" => {
+                        // Keep normal output clean; only show cache details in debug mode.
+                        if env::v().debug >= 1 {
+                            pretty_write(pid, "", &format!("{} {}", kind, msg));
+                        }
+                    }
                     "error" => {
                         let cfg = cfg();
                         let _ = writeln!(
@@ -184,6 +190,26 @@ impl Log {
 
     pub fn warn(msg: &str) {
         Self::meta("warning", msg, None);
+    }
+
+    pub fn cache_hit(target: &str, keyprefix: &str, bytes: u64) {
+        Self::meta("cache_hit", &format!("{} {} {}", target, keyprefix, bytes), None);
+    }
+
+    pub fn cache_miss(target: &str, reason: &str) {
+        Self::meta("cache_miss", &format!("{} {}", target, reason), None);
+    }
+
+    pub fn cache_store(target: &str, keyprefix: &str, bytes: u64) {
+        Self::meta("cache_store", &format!("{} {} {}", target, keyprefix, bytes), None);
+    }
+
+    pub fn cache_skip(target: &str, reason: &str) {
+        Self::meta("cache_skip", &format!("{} {}", target, reason), None);
+    }
+
+    pub fn cache_stats(msg: &str) {
+        Self::meta("cache_stats", msg, None);
     }
 
     pub fn debug(msg: &str) {

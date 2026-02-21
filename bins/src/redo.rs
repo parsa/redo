@@ -223,6 +223,7 @@ fn main() {
     let mut color: i32 = 1; // 0=off,1=auto,2=force
     let mut debug_locks = false;
     let mut debug_pids = false;
+    let mut plan_only = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -279,6 +280,11 @@ fn main() {
         }
         if a == "--no-status" {
             status = false;
+            i += 1;
+            continue;
+        }
+        if a == "--plan" {
+            plan_only = true;
             i += 1;
             continue;
         }
@@ -341,6 +347,27 @@ fn main() {
         eprintln!("redo:   ...details: https://github.com/Microsoft/WSL/issues/1927");
         if jobs > 1 {
             jobs = 1;
+        }
+    }
+
+    // Planning-only mode: compute the preflight plan (if available) and exit.
+    if plan_only {
+        match compute_build_plan(&targets) {
+            Ok(Some(plan)) => {
+                println!(
+                    "dirty={} total={} uptodate={}",
+                    plan.dirty, plan.total, plan.uptodate
+                );
+                std::process::exit(0);
+            }
+            Ok(None) => {
+                println!("no_plan");
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("{:?}", e);
+                std::process::exit(1);
+            }
         }
     }
 

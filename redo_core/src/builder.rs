@@ -7,16 +7,20 @@
 //! - Coordinate parallelism via the GNU make jobserver and integrate with `redo-log`.
 
 use std::ffi::CString;
+use std::collections::HashSet;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use crate::{cycles, deps, env, jobserver, logs::Log, paths, state};
+use crate::{action_cache, cycles, deps, env, jobserver, logs::Log, paths, remote_cache, state};
+use sha2::Digest;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+const STRICT_POLICY_READTRACE: &str = "strict-readtrace";
 
 fn record_fsync_marker() {
     let Ok(p) = std::env::var("REDO_TEST_FSYNC_MARKER") else { return; };
@@ -106,6 +110,161 @@ fn read_first_line(p: &Path) -> anyhow::Result<Option<String>> {
     Ok(s.lines().next().map(|l| l.to_string()))
 }
 
+fn normalize_path_lex(p: &Path) -> PathBuf {
+    // Lexical normalization: removes '.' and resolves '..' without touching the filesystem.
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for c in p.components() {
+        use std::path::Component;
+        match c {
+            Component::Prefix(pre) => parts.push(pre.as_os_str().to_os_string()),
+            Component::RootDir => {
+                parts.clear();
+                parts.push(std::ffi::OsString::from("/"));
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if parts.len() > 1 {
+                    parts.pop();
+                }
+            }
+            Component::Normal(s) => parts.push(s.to_os_string()),
+        }
+    }
+    if parts.is_empty() {
+        return PathBuf::new();
+    }
+    let mut out = PathBuf::new();
+    for (i, p) in parts.iter().enumerate() {
+        if i == 0 && p == "/" {
+            out.push(Path::new("/"));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+fn parse_nul_separated_strings(bytes: &[u8]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in bytes.split(|&b| b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        out.push(String::from_utf8_lossy(entry).to_string());
+    }
+    out
+}
+
+fn read_trace_out0(path: &Path) -> anyhow::Result<Vec<String>> {
+    let bytes = fs::read(path)?;
+    Ok(parse_nul_separated_strings(&bytes))
+}
+
+fn read_deps_out0(path: &Path) -> anyhow::Result<Vec<(char, String)>> {
+    let bytes = fs::read(path)?;
+    let parts = parse_nul_separated_strings(&bytes);
+    let mut out: Vec<(char, String)> = Vec::new();
+    let mut i = 0usize;
+    while i + 1 < parts.len() {
+        let mode_s = parts[i].trim().to_string();
+        let dep_s = parts[i + 1].to_string();
+        let mode = mode_s.chars().next().unwrap_or('?');
+        if mode == 'm' || mode == 'c' {
+            out.push((mode, dep_s));
+        }
+        i += 2;
+    }
+    Ok(out)
+}
+
+#[derive(Debug)]
+struct StrictReadTraceResult {
+    trace_ok: bool,
+    trace_reason: String,
+    violations: Vec<String>,
+}
+
+fn evaluate_strict_readtrace(
+    base: &Path,
+    declared: &[(char, state::File)],
+    trace_entries: &[String],
+) -> StrictReadTraceResult {
+    let redo_dir = normalize_path_lex(&base.join(".redo"));
+
+    let mut allowed: HashSet<PathBuf> = HashSet::new();
+    for (_mode, dep) in declared.iter() {
+        if dep.name == state::ALWAYS {
+            continue;
+        }
+        let abs = normalize_path_lex(&base.join(&dep.name));
+        if abs.starts_with(&redo_dir) {
+            continue;
+        }
+        allowed.insert(abs);
+    }
+
+    let mut trace_ok = true;
+    let mut trace_reason = String::new();
+    let mut observed: HashSet<PathBuf> = HashSet::new();
+    for e in trace_entries.iter() {
+        if e.is_empty() {
+            continue;
+        }
+        if let Some(rest) = e.strip_prefix("TRACE_UNAVAILABLE:") {
+            trace_ok = false;
+            if trace_reason.is_empty() {
+                trace_reason = rest.to_string();
+            }
+            continue;
+        }
+        if let Some(rest) = e.strip_prefix("TRACE_ERROR:") {
+            trace_ok = false;
+            if trace_reason.is_empty() {
+                trace_reason = rest.to_string();
+            }
+            continue;
+        }
+        if e.starts_with("UNRESOLVED:") {
+            trace_ok = false;
+            if trace_reason.is_empty() {
+                trace_reason = "unresolved".to_string();
+            }
+            continue;
+        }
+        let p = Path::new(e);
+        let abs = if p.is_absolute() {
+            normalize_path_lex(p)
+        } else {
+            normalize_path_lex(&base.join(p))
+        };
+        if abs.starts_with(&redo_dir) {
+            continue;
+        }
+        if abs.starts_with(base) {
+            observed.insert(abs);
+        }
+    }
+
+    let mut violations: Vec<String> = Vec::new();
+    for p in observed {
+        if !allowed.contains(&p) {
+            let rel = p
+                .strip_prefix(base)
+                .ok()
+                .map(|rp| rp.to_string_lossy().to_string())
+                .unwrap_or_else(|| p.to_string_lossy().to_string());
+            violations.push(rel);
+        }
+    }
+    violations.sort();
+    violations.dedup();
+    StrictReadTraceResult {
+        trace_ok,
+        trace_reason,
+        violations,
+    }
+}
+
 fn exec_dofile_in_child(
     dodir: &Path,
     dofile: &str,
@@ -114,6 +273,8 @@ fn exec_dofile_in_child(
     arg3: &str,
     stdout_fd: RawFd,
     lock_fid: i64,
+    argv_override: Option<Vec<String>>,
+    trace_out0: Option<&Path>,
 ) -> anyhow::Result<()> {
     let verbose0 = env::v().verbose;
     let xtrace0 = env::v().xtrace;
@@ -201,37 +362,57 @@ fn exec_dofile_in_child(
         std::env::set_var("REDO_LOG", "");
     }
 
-    // argv default: /bin/sh -e[v][x] dofile arg1 arg2 arg3.
-    // Using an absolute path avoids PATH shadowing and makes behavior more predictable.
-    let mut shflag = "-e".to_string();
-    if verbose0 > 0 {
-        shflag.push('v');
-    }
-    if xtrace0 > 0 {
-        shflag.push('x');
-    }
-    let mut argv: Vec<String> = vec![
-        "/bin/sh".into(),
-        shflag,
-        dofile.into(),
-        arg1.into(),
-        arg2.into(),
-        arg3.into(),
-    ];
+    let mut argv: Vec<String> = if let Some(v) = argv_override {
+        v
+    } else {
+        // argv default: /bin/sh -e[v][x] dofile arg1 arg2 arg3.
+        // Using an absolute path avoids PATH shadowing and makes behavior more predictable.
+        let mut shflag = "-e".to_string();
+        if verbose0 > 0 {
+            shflag.push('v');
+        }
+        if xtrace0 > 0 {
+            shflag.push('x');
+        }
+        let mut argv: Vec<String> = vec![
+            "/bin/sh".into(),
+            shflag,
+            dofile.into(),
+            arg1.into(),
+            arg2.into(),
+            arg3.into(),
+        ];
 
-    // shebang override (eg. "#!/usr/bin/env perl")
-    if let Ok(Some(line1)) = read_first_line(&dodir.join(dofile)) {
-        if let Some(rest) = line1.strip_prefix("#!") {
-            let rest = rest.trim();
-            let parts: Vec<&str> = rest.split_whitespace().collect();
-            if !parts.is_empty() {
-                argv[0] = parts[0].to_string();
-                // Drop the sh -e[vx] flag when using an explicit interpreter line.
-                argv.remove(1);
-                for (i, p) in parts.iter().skip(1).enumerate() {
-                    argv.insert(1 + i, p.to_string());
+        // shebang override (eg. "#!/usr/bin/env perl")
+        if let Ok(Some(line1)) = read_first_line(&dodir.join(dofile)) {
+            if let Some(rest) = line1.strip_prefix("#!") {
+                let rest = rest.trim();
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if !parts.is_empty() {
+                    argv[0] = parts[0].to_string();
+                    // Drop the sh -e[vx] flag when using an explicit interpreter line.
+                    argv.remove(1);
+                    for (i, p) in parts.iter().skip(1).enumerate() {
+                        argv.insert(1 + i, p.to_string());
+                    }
                 }
             }
+        }
+        argv
+    };
+
+    if env::v().strict {
+        if let Some(p) = trace_out0 {
+            let mut wrapped: Vec<String> = vec![
+                "redo-trace".into(),
+                "--trace-out0".into(),
+                p.to_string_lossy().to_string(),
+                "--mode".into(),
+                "read".into(),
+                "--".into(),
+            ];
+            wrapped.extend(argv);
+            argv = wrapped;
         }
     }
 
@@ -415,12 +596,21 @@ fn find_do_for_target_no_deps(
 struct PendingBuild {
     t: String,
     trp: String,
+    dodir: PathBuf,
     abs_target: PathBuf,
     tmpname: PathBuf,
     outfile: fs::File,
     before_t: Option<std::fs::Metadata>,
     dofile: String,
     sf: state::File,
+    cache_key: Option<action_cache::ActionKey>,
+    policy_domain: Option<String>,
+    trace_out0: Option<PathBuf>,
+    deps_out0: Option<PathBuf>,
+    remote_ok: Option<PathBuf>,
+    remote_exec: bool,
+    strict: bool,
+    strict_fail: bool,
     pool_lock: Option<state::Lock>,
     lock: Option<state::Lock>,
 }
@@ -438,6 +628,33 @@ fn schedule_build_one(
     rc_flag: Arc<AtomicI32>,
 ) -> anyhow::Result<ScheduleBuildOneResult> {
     let abs_target = env::v().base.join(&sf.name);
+    let strict = env::v().strict;
+    let strict_fail = env::v().strict_fail;
+    let remote_exec_enabled = {
+        let v = std::env::var("REDO_REMOTE_EXEC").unwrap_or_default();
+        let v = v.trim();
+        !v.is_empty() && v != "0"
+    };
+    let remote_platform_id = std::env::var("REDO_REMOTE_PLATFORM_ID").unwrap_or_default();
+    let remote_exec_wanted = remote_exec_enabled && !remote_platform_id.trim().is_empty();
+    let policy_domain: Option<String> = if remote_exec_wanted {
+        if strict {
+            Some(format!(
+                "{};remote_platform={}",
+                STRICT_POLICY_READTRACE,
+                remote_platform_id.trim()
+            ))
+        } else {
+            Some(format!(
+                "policy=remote-exec;platform={}",
+                remote_platform_id.trim()
+            ))
+        }
+    } else if strict {
+        Some(STRICT_POLICY_READTRACE.to_string())
+    } else {
+        None
+    };
 
     let trp = state::target_relpath(&abs_target).to_string_lossy().to_string();
     Log::meta("do", &trp, None);
@@ -535,22 +752,462 @@ fn schedule_build_one(
     let tmpname = dodir.join(format!("{}.redo.tmp", arg1));
     unlink_best_effort(&tmpname);
 
+    // Read trace output (NUL-separated list). This is used by strict-mode cache gating,
+    // and is also required for remote-exec so we can reuse strict-mode evaluation.
+    let trace_out0: Option<PathBuf> = if strict || remote_exec_wanted {
+        let runid = env::v().runid.unwrap_or(0);
+        let d = env::v().base.join(".redo").join("trace");
+        let _ = fs::create_dir_all(&d);
+        Some(d.join(format!("readtrace.{}.{}.{}.out0", runid, sf.id, std::process::id())))
+    } else {
+        None
+    };
+    if let Some(p) = &trace_out0 {
+        let _ = fs::remove_file(p);
+    }
+
+    let (deps_out0, remote_ok): (Option<PathBuf>, Option<PathBuf>) = if remote_exec_wanted {
+        let runid = env::v().runid.unwrap_or(0);
+        let d = env::v().base.join(".redo").join("remote");
+        let _ = fs::create_dir_all(&d);
+        let deps = d.join(format!("deps.{}.{}.{}.out0", runid, sf.id, std::process::id()));
+        let ok = d.join(format!(
+            "ok.{}.{}.{}.flag",
+            runid,
+            sf.id,
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&deps);
+        let _ = fs::remove_file(&ok);
+        (Some(deps), Some(ok))
+    } else {
+        (None, None)
+    };
+
+    // Phase 1 local action cache (restricted): consult only under redo-ifchange.
+    // Note: schedule_build_one is only used by redo-ifchange's scheduler.
+    let mut cache_key: Option<action_cache::ActionKey> = None;
+    if action_cache::enabled_default_on() {
+        if sf.csum.is_some() {
+            // If a rule is using redo-stamp checksums, we currently don't try to cache it.
+            Log::cache_skip(&trp, "csum");
+        } else {
+            let mut deps_for_key = sf.deps()?;
+
+            // Hybrid dep semantics: ensure missing mode=m generated deps exist.
+            // (Missing non-generated deps are treated as an error.)
+            for (mode, dep) in deps_for_key.iter() {
+                if *mode != 'm' || dep.id == sf.id || dep.name == state::ALWAYS {
+                    continue;
+                }
+                let dep_abs = env::v().base.join(&dep.name);
+                if dep_abs.exists() {
+                    continue;
+                }
+                if dep.is_generated {
+                    // Preserve cycle detection: while holding `sf`'s lock, temporarily
+                    // add it to the cycles set for any nested builds.
+                    let saved_cycles = std::env::var("REDO_CYCLES").unwrap_or_default();
+                    std::env::set_var("REDO_CYCLES", saved_cycles.clone());
+                    cycles::add(sf.id);
+                    let rv = build_one(dep_abs.to_string_lossy().as_ref())?;
+                    std::env::set_var("REDO_CYCLES", saved_cycles);
+                    if rv != 0 {
+                        Log::err(&format!(
+                            "{}: failed to build missing dependency {}",
+                            trp, dep.name
+                        ));
+                        sf.set_failed()?;
+                        sf.save()?;
+                        state::commit()?;
+                        if let Some(l) = lock.as_mut() {
+                            l.unlock()?;
+                        }
+                        Log::meta("done", &format!("1 {}", trp), None);
+                        rc_flag.store(1, Ordering::Relaxed);
+                        return Ok(ScheduleBuildOneResult::Scheduled);
+                    }
+                } else {
+                    Log::err(&format!(
+                        "{}: missing required dependency {}",
+                        trp, dep.name
+                    ));
+                    sf.set_failed()?;
+                    sf.save()?;
+                    state::commit()?;
+                    if let Some(l) = lock.as_mut() {
+                        l.unlock()?;
+                    }
+                    Log::meta("done", &format!("1 {}", trp), None);
+                    rc_flag.store(1, Ordering::Relaxed);
+                    return Ok(ScheduleBuildOneResult::Scheduled);
+                }
+            }
+
+            let (elig, key) = if let Some(p) = policy_domain.as_deref() {
+                action_cache::compute_action_key_v0_policy(p, &sf.name, deps_for_key.as_mut_slice())?
+            } else {
+                action_cache::compute_action_key_v0(&sf.name, deps_for_key.as_mut_slice())?
+            };
+            match elig {
+                action_cache::Eligibility::SkipAlways => {
+                    Log::cache_skip(&trp, "always");
+                }
+                action_cache::Eligibility::Eligible => {
+                    if let Some((blob, meta)) = action_cache::lookup(&key) {
+                        // Cache hit: materialize to $3 then rename into place.
+                        Log::cache_hit(&trp, key.prefix(), meta.size);
+                        match action_cache::materialize(&blob, &meta, &tmpname) {
+                            Ok(_bytes) => match durable_rename(&tmpname, &abs_target) {
+                                Ok(()) => {
+                                    // Update state similarly to a successful build.
+                                    sf.refresh()?;
+                                    sf.is_generated = true;
+                                    sf.is_override = false;
+                                    sf.failed_runid = None;
+                                    sf.csum = None;
+                                    sf.update_stamp(false)?;
+
+                                    // We called zap_deps1() earlier; re-add deps to clear delete_me,
+                                    // then delete any truly-stale entries.
+                                    for (mode, dep) in deps_for_key.iter() {
+                                        let dep_arg = if dep.name == state::ALWAYS {
+                                            state::ALWAYS.to_string()
+                                        } else {
+                                            env::v()
+                                                .base
+                                                .join(&dep.name)
+                                                .to_string_lossy()
+                                                .to_string()
+                                        };
+                                        sf.add_dep(*mode, &dep_arg)?;
+                                    }
+                                    sf.zap_deps2()?;
+                                    sf.save()?;
+                                    state::commit()?;
+
+                                    if let Some(l) = lock.as_mut() {
+                                        l.unlock()?;
+                                    }
+                                    Log::meta("done", &format!("0 {}", trp), None);
+                                    return Ok(ScheduleBuildOneResult::Scheduled);
+                                }
+                                Err(e) => {
+                                    Log::cache_skip(&trp, &format!("rename {}", e));
+                                    unlink_best_effort(&tmpname);
+                                    cache_key = Some(key);
+                                }
+                            },
+                            Err(e) => {
+                                Log::cache_skip(&trp, &format!("materialize {}", e));
+                                unlink_best_effort(&tmpname);
+                                cache_key = Some(key);
+                            }
+                        }
+                    } else {
+                        Log::cache_miss(&trp, "no_entry");
+                        cache_key = Some(key.clone());
+
+                        // Phase 2 remote artifact cache (best-effort): consult remote
+                        // CAS/index on local miss. Keep all failures as a fallback
+                        // to local execution.
+                        match remote_cache::config_from_env() {
+                            Ok(Some(cfg)) => {
+                                // Avoid holding sqlite write transactions while waiting on network.
+                                let _ = state::commit();
+                                match if let Some(p) = policy_domain.as_deref() {
+                                    action_cache::compute_action_key_v1_remote_policy(
+                                        p,
+                                        &sf.name,
+                                        deps_for_key.as_mut_slice(),
+                                    )
+                                } else {
+                                    action_cache::compute_action_key_v1_remote(
+                                        &sf.name,
+                                        deps_for_key.as_mut_slice(),
+                                    )
+                                } {
+                                    Ok((action_cache::Eligibility::Eligible, rkey)) => {
+                                        match remote_cache::get_action_manifest_sha256(
+                                            &cfg,
+                                            &rkey.hex,
+                                        ) {
+                                            Ok(Some(man_hex)) => {
+                                                // Download+verify manifest blob.
+                                                match remote_cache::get_blob_bytes_verified(
+                                                    &cfg,
+                                                    &man_hex,
+                                                ) {
+                                                    Ok(man_bytes) => {
+                                                        let man_s = String::from_utf8_lossy(&man_bytes).to_string();
+                                                        match remote_cache::parse_artifact_manifest_v1(&man_s) {
+                                                            Ok(m) => {
+                                                                // Download+verify output blob to tmpname, then rename into place.
+                                                                Log::cache_hit(&trp, rkey.prefix(), m.size);
+                                                                match remote_cache::download_blob_to_file_verified(
+                                                                    &cfg,
+                                                                    &m.blob_sha256,
+                                                                    &tmpname,
+                                                                ) {
+                                                                    Ok(_bytes) => {
+                                                                        let perm = fs::Permissions::from_mode(m.mode & 0o777);
+                                                                        let _ = fs::set_permissions(&tmpname, perm);
+                                                                        match durable_rename(&tmpname, &abs_target) {
+                                                                            Ok(()) => {
+                                                                                // Update state similarly to a successful build.
+                                                                                sf.refresh()?;
+                                                                                sf.is_generated = true;
+                                                                                sf.is_override = false;
+                                                                                sf.failed_runid = None;
+                                                                                sf.csum = None;
+                                                                                sf.update_stamp(false)?;
+
+                                                                                // We called zap_deps1() earlier; re-add deps to clear delete_me,
+                                                                                // then delete any truly-stale entries.
+                                                                                for (mode, dep) in deps_for_key.iter() {
+                                                                                    let dep_arg = if dep.name == state::ALWAYS {
+                                                                                        state::ALWAYS.to_string()
+                                                                                    } else {
+                                                                                        env::v()
+                                                                                            .base
+                                                                                            .join(&dep.name)
+                                                                                            .to_string_lossy()
+                                                                                            .to_string()
+                                                                                    };
+                                                                                    sf.add_dep(*mode, &dep_arg)?;
+                                                                                }
+                                                                                sf.zap_deps2()?;
+                                                                                sf.save()?;
+                                                                                state::commit()?;
+
+                                                                                if let Some(l) = lock.as_mut() {
+                                                                                    l.unlock()?;
+                                                                                }
+                                                                                Log::meta("done", &format!("0 {}", trp), None);
+
+                                                                                // Best-effort: populate local cache so future runs don't need the network.
+                                                                                let _ = action_cache::store(&key, &abs_target, m.mode & 0o777);
+                                                                                return Ok(ScheduleBuildOneResult::Scheduled);
+                                                                            }
+                                                                            Err(e) => {
+                                                                                Log::cache_skip(&trp, &format!("rename {}", e));
+                                                                                unlink_best_effort(&tmpname);
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                    Err(e) => {
+                                                                        Log::cache_skip(&trp, &format!("remote_blob {}", e));
+                                                                        unlink_best_effort(&tmpname);
+                                                                    }
+                                                                }
+                                                            }
+                                                            Err(e) => {
+                                                                Log::cache_skip(&trp, &format!("remote_manifest {}", e));
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        Log::cache_skip(&trp, &format!("remote_manifest_blob {}", e));
+                                                    }
+                                                }
+                                            }
+                                            Ok(None) => {
+                                                Log::cache_miss(&trp, "remote_no_entry");
+                                            }
+                                            Err(e) => {
+                                                Log::cache_skip(&trp, &format!("remote_lookup {}", e));
+                                            }
+                                        }
+                                    }
+                                    Ok((action_cache::Eligibility::SkipAlways, _)) => {
+                                        Log::cache_skip(&trp, "always");
+                                    }
+                                    Err(e) => {
+                                        Log::cache_skip(&trp, &format!("remote_key {}", e));
+                                    }
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(e) => {
+                                Log::cache_skip(&trp, &format!("remote_cfg {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // If we didn't take a cache hit, we're about to start a jobserver job. If we
+    // synchronously built any missing deps above, we may have released our token;
+    // reacquire one before calling jobserver::start().
+    //
+    // $3 is expressed relative to dodir.
+    let rel_arg3 = pathdiff::diff_paths(&tmpname, &dodir).unwrap_or(tmpname.clone());
+    let mut argv_override: Option<Vec<String>> = None;
+    let mut trace_out0_for_child: Option<PathBuf> = trace_out0.clone();
+    let mut remote_exec_job = false;
+    let mut deps_out0_use: Option<PathBuf> = None;
+    let mut remote_ok_use: Option<PathBuf> = None;
+    if remote_exec_wanted && cache_key.is_some() {
+        // Only attempt remote exec if the remote cache URL is configured.
+        match remote_cache::config_from_env() {
+            Ok(Some(_cfg)) => {
+                // Collect mode=m deps (workspace-relative) to upload as inputs.
+                let mut inputs: Vec<String> = Vec::new();
+                let mut bad = false;
+                if let Ok(deps_now) = sf.deps() {
+                    for (mode, dep) in deps_now.iter() {
+                        if *mode == 'm' {
+                            if dep.id == sf.id || dep.name == state::ALWAYS {
+                                continue;
+                            }
+                            let abs = env::v().base.join(&dep.name);
+                            match fs::symlink_metadata(&abs) {
+                                Ok(st) if st.is_file() => inputs.push(dep.name.clone()),
+                                Ok(_) | Err(_) => {
+                                    bad = true;
+                                    break;
+                                }
+                            }
+                        } else if *mode == 'c' {
+                            // For correctness parity with local: ensure the negative dep
+                            // is still missing in the client workspace.
+                            let abs = env::v().base.join(&dep.name);
+                            if abs.exists() {
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                } else {
+                    bad = true;
+                }
+
+                if !bad {
+                    let trace_p = trace_out0.as_ref();
+                    let deps_p = deps_out0.as_ref();
+                    let ok_p = remote_ok.as_ref();
+                    if trace_p.is_none() || deps_p.is_none() || ok_p.is_none() {
+                        bad = true;
+                    }
+                    if bad {
+                        // Fall back to local execution.
+                        // (Do not return here; continue below.)
+                    } else {
+                        let trace_p = trace_p.unwrap();
+                        let deps_p = deps_p.unwrap();
+                        let ok_p = ok_p.unwrap();
+
+                    let base = env::v().base;
+                    let cwd_rel = pathdiff::diff_paths(&dodir, &base)
+                        .unwrap_or(dodir.clone())
+                        .to_string_lossy()
+                        .to_string();
+                    let tmp_rel = pathdiff::diff_paths(&tmpname, &base)
+                        .unwrap_or(tmpname.clone())
+                        .to_string_lossy()
+                        .to_string();
+
+                    // Action argv as it would run locally (without local strict tracing).
+                    let verbose0 = env::v().verbose;
+                    let xtrace0 = env::v().xtrace;
+                    let mut shflag = "-e".to_string();
+                    if verbose0 > 0 {
+                        shflag.push('v');
+                    }
+                    if xtrace0 > 0 {
+                        shflag.push('x');
+                    }
+                    let rel_arg3_s = rel_arg3.to_string_lossy().to_string();
+                    let mut action_argv: Vec<String> = vec![
+                        "/bin/sh".into(),
+                        shflag,
+                        dofile.clone(),
+                        arg1.clone(),
+                        arg2.clone(),
+                        rel_arg3_s,
+                    ];
+                    if let Ok(Some(line1)) = read_first_line(&dodir.join(&dofile)) {
+                        if let Some(rest) = line1.strip_prefix("#!") {
+                            let rest = rest.trim();
+                            let parts: Vec<&str> = rest.split_whitespace().collect();
+                            if !parts.is_empty() {
+                                action_argv[0] = parts[0].to_string();
+                                action_argv.remove(1);
+                                for (i, p) in parts.iter().skip(1).enumerate() {
+                                    action_argv.insert(1 + i, p.to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    let mut wargv: Vec<String> = Vec::new();
+                    wargv.push("redo-remote-exec".to_string());
+                    wargv.push("--out".to_string());
+                    wargv.push(tmpname.to_string_lossy().to_string());
+                    wargv.push("--deps-out0".to_string());
+                    wargv.push(deps_p.to_string_lossy().to_string());
+                    wargv.push("--trace-out0".to_string());
+                    wargv.push(trace_p.to_string_lossy().to_string());
+                    wargv.push("--remote-ok".to_string());
+                    wargv.push(ok_p.to_string_lossy().to_string());
+                    wargv.push("--cwd-rel".to_string());
+                    wargv.push(cwd_rel);
+                    wargv.push("--target-rel".to_string());
+                    wargv.push(sf.name.clone());
+                    wargv.push("--tmp-rel".to_string());
+                    wargv.push(tmp_rel);
+                    for inp in inputs {
+                        wargv.push("--input".to_string());
+                        wargv.push(inp);
+                    }
+                    wargv.push("--".to_string());
+                    wargv.extend(action_argv);
+
+                    remote_exec_job = true;
+                    deps_out0_use = Some(deps_p.clone());
+                    remote_ok_use = Some(ok_p.clone());
+                    argv_override = Some(wargv);
+                    // Do not wrap the local wrapper with redo-trace; remote tracing is
+                    // performed by the server, and local fallback (if needed) is done by
+                    // the wrapper itself.
+                    trace_out0_for_child = None;
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                Log::warn(&format!("remote_exec: remote_cfg error: {:?}", e));
+            }
+        }
+    }
+
+    jobserver::ensure_token_or_cheat(t, || 0)?;
+
     let outfile = mkstemp_unlinked()?;
     let outfd = outfile.as_raw_fd();
 
     // Run script; it will typically write to stdout or to $3.
-    // $3 is expressed relative to dodir.
-    let rel_arg3 = pathdiff::diff_paths(&tmpname, &dodir).unwrap_or(tmpname.clone());
 
     let pb = PendingBuild {
         t: t.to_string(),
         trp: trp.clone(),
+        dodir: dodir.clone(),
         abs_target: abs_target.clone(),
         tmpname: tmpname.clone(),
         outfile,
         before_t,
         dofile: dofile.clone(),
         sf: sf.clone(),
+        cache_key,
+        policy_domain: policy_domain.clone(),
+        trace_out0: trace_out0.clone(),
+        deps_out0: deps_out0_use.clone(),
+        remote_ok: remote_ok_use.clone(),
+        remote_exec: remote_exec_job,
+        strict,
+        strict_fail,
         pool_lock,
         lock,
     };
@@ -565,12 +1222,26 @@ fn schedule_build_one(
     let arg2_2 = arg2.clone();
     let arg3_2 = rel_arg3.to_string_lossy().to_string();
     let lock_fid = sf.id;
+    let argv_override_2 = argv_override.clone();
+    let trace_out0_2 = trace_out0_for_child.clone();
     let pb2 = pb.clone();
     let rc2 = rc_flag.clone();
 
     jobserver::start(
         t,
-        move || exec_dofile_in_child(&dodir2, &dofile2, &arg1_2, &arg2_2, &arg3_2, outfd, lock_fid),
+        move || {
+            exec_dofile_in_child(
+                &dodir2,
+                &dofile2,
+                &arg1_2,
+                &arg2_2,
+                &arg3_2,
+                outfd,
+                lock_fid,
+                argv_override_2,
+                trace_out0_2.as_deref(),
+            )
+        },
         move |_name, rv| {
             let mut pb = pb2.lock().unwrap();
 
@@ -663,9 +1334,233 @@ fn schedule_build_one(
                             let _ = pb.sf.update_stamp(false);
                             pb.sf.set_changed();
                         }
+
+                        // If this job ran remotely, declared deps were recorded into
+                        // `deps.out0` instead of the local sqlite DB. Apply them now
+                        // (before zap_deps2 / strict evaluation / caching).
+                        let remote_ran = pb
+                            .remote_ok
+                            .as_ref()
+                            .map(|p| p.exists())
+                            .unwrap_or(false);
+                        if remote_ran {
+                            match pb.deps_out0.as_ref() {
+                                Some(p) => match read_deps_out0(p) {
+                                    Ok(deps_pairs) => {
+                                        for (mode, dep_s) in deps_pairs {
+                                            if dep_s.is_empty() {
+                                                continue;
+                                            }
+                                            let dep_arg = if dep_s == state::ALWAYS {
+                                                state::ALWAYS.to_string()
+                                            } else if Path::new(&dep_s).is_absolute() {
+                                                dep_s
+                                            } else {
+                                                pb.dodir
+                                                    .join(dep_s)
+                                                    .to_string_lossy()
+                                                    .to_string()
+                                            };
+                                            if let Err(e) = pb.sf.add_dep(mode, &dep_arg) {
+                                                Log::err(&format!(
+                                                    "{}: remote deps apply failed: {:?}",
+                                                    pb.t, e
+                                                ));
+                                                final_rv = 209;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        Log::err(&format!("{}: remote deps read failed: {:?}", pb.t, e));
+                                        final_rv = 209;
+                                    }
+                                },
+                                None => {
+                                    Log::err(&format!("{}: remote deps missing deps_out0 path", pb.t));
+                                    final_rv = 209;
+                                }
+                            }
+                        }
+                        if let Some(p) = pb.deps_out0.as_ref() {
+                            let _ = fs::remove_file(p);
+                        }
+                        if let Some(p) = pb.remote_ok.as_ref() {
+                            let _ = fs::remove_file(p);
+                        }
+
                         let _ = pb.sf.zap_deps2();
-                        let _ = pb.sf.save();
-                        let _ = state::commit();
+                        let mut strict_cache_ok = true;
+                        if pb.strict {
+                            let base = env::v().base;
+                            let trace_entries: Vec<String> = match pb.trace_out0.as_ref() {
+                                Some(p) => read_trace_out0(p).unwrap_or_else(|_| {
+                                    vec!["TRACE_UNAVAILABLE:read_failed".to_string()]
+                                }),
+                                None => vec!["TRACE_UNAVAILABLE:missing_path".to_string()],
+                            };
+                            if let Some(p) = pb.trace_out0.as_ref() {
+                                let _ = fs::remove_file(p);
+                            }
+
+                            let declared = pb.sf.deps().unwrap_or_default();
+                            let res = evaluate_strict_readtrace(&base, &declared, &trace_entries);
+                            if !res.trace_ok {
+                                strict_cache_ok = false;
+                                let why = if res.trace_reason.is_empty() {
+                                    "unknown".to_string()
+                                } else {
+                                    res.trace_reason.clone()
+                                };
+                                let msg = format!("strict: read trace unavailable ({})", why);
+                                if pb.strict_fail {
+                                    Log::err(&msg);
+                                    final_rv = 218;
+                                } else {
+                                    Log::warn(&msg);
+                                }
+                            } else if !res.violations.is_empty() {
+                                strict_cache_ok = false;
+                                let msg = format!(
+                                    "strict: undeclared reads: {}",
+                                    res.violations.join(", ")
+                                );
+                                if pb.strict_fail {
+                                    Log::err(&msg);
+                                    final_rv = 218;
+                                } else {
+                                    Log::warn(&msg);
+                                }
+                            }
+                        }
+                        if !pb.strict {
+                            // Best-effort cleanup: remote-exec can produce a trace file even when strict
+                            // mode is disabled (for compatibility / future reuse).
+                            if let Some(p) = pb.trace_out0.as_ref() {
+                                let _ = fs::remove_file(p);
+                            }
+                        }
+
+                        if final_rv == 0 {
+                            let _ = pb.sf.save();
+                            let commit_ok = state::commit().is_ok();
+                            if commit_ok {
+                                if pb.cache_key.is_some() {
+                                    if pb.strict && !strict_cache_ok {
+                                        Log::cache_skip(&pb.trp, "strict");
+                                    } else {
+                                        match fs::symlink_metadata(&pb.abs_target) {
+                                            Ok(st) if st.is_file() => {
+                                                let mode = st.mode();
+                                                if pb.sf.csum.is_some() {
+                                                    Log::cache_skip(&pb.trp, "csum");
+                                                } else if let Ok(mut deps_for_key) = pb.sf.deps() {
+                                                    let key_res = if let Some(p) = pb.policy_domain.as_deref() {
+                                                        action_cache::compute_action_key_v0_policy(
+                                                            p,
+                                                            &pb.sf.name,
+                                                            deps_for_key.as_mut_slice(),
+                                                        )
+                                                    } else {
+                                                        action_cache::compute_action_key_v0(
+                                                            &pb.sf.name,
+                                                            deps_for_key.as_mut_slice(),
+                                                        )
+                                                    };
+                                                    match key_res {
+                                                        Ok((action_cache::Eligibility::SkipAlways, _)) => {
+                                                            Log::cache_skip(&pb.trp, "always");
+                                                        }
+                                                        Ok((action_cache::Eligibility::Eligible, k)) => {
+                                                            match action_cache::store(&k, &pb.abs_target, mode) {
+                                                                Ok(bytes) => {
+                                                                    Log::cache_store(&pb.trp, k.prefix(), bytes);
+
+                                                                    // Phase 2 remote artifact cache push (best-effort).
+                                                                    if let Ok(Some(cfg)) =
+                                                                        remote_cache::config_from_env()
+                                                                    {
+                                                                        if cfg.push_enabled {
+                                                                            if let Some((blob, meta)) =
+                                                                                action_cache::lookup(&k)
+                                                                            {
+                                                                                if !meta.sha256.is_empty() {
+                                                                                    let manifest_json = format!(
+                                                                                        "{{\"schema\":\"redo-artifact-manifest:v1\",\"kind\":\"file\",\"digest\":\"sha256:{}\",\"size\":{},\"mode\":{}}}",
+                                                                                        meta.sha256,
+                                                                                        meta.size,
+                                                                                        meta.mode & 0o777
+                                                                                    );
+                                                                                    let mut hh = sha2::Sha256::new();
+                                                                                    hh.update(manifest_json.as_bytes());
+                                                                                    let man_hex = format!(
+                                                                                        "{:x}",
+                                                                                        hh.finalize()
+                                                                                    );
+
+                                                                                    let rkey_res = if let Some(p) = pb.policy_domain.as_deref() {
+                                                                                        action_cache::compute_action_key_v1_remote_policy(
+                                                                                            p,
+                                                                                            &pb.sf.name,
+                                                                                            deps_for_key.as_mut_slice(),
+                                                                                        )
+                                                                                    } else {
+                                                                                        action_cache::compute_action_key_v1_remote(
+                                                                                            &pb.sf.name,
+                                                                                            deps_for_key.as_mut_slice(),
+                                                                                        )
+                                                                                    };
+                                                                                    if let Ok((action_cache::Eligibility::Eligible, rkey)) = rkey_res {
+                                                                                        let _ = remote_cache::put_blob_from_file(
+                                                                                            &cfg,
+                                                                                            &meta.sha256,
+                                                                                            &blob,
+                                                                                        );
+                                                                                        let _ = remote_cache::put_blob_bytes(
+                                                                                            &cfg,
+                                                                                            &man_hex,
+                                                                                            manifest_json.as_bytes(),
+                                                                                        );
+                                                                                        let _ = remote_cache::put_action_mapping(
+                                                                                            &cfg,
+                                                                                            &rkey.hex,
+                                                                                            &man_hex,
+                                                                                        );
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    Log::cache_skip(
+                                                                        &pb.trp,
+                                                                        &format!("store {}", e),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            Log::cache_skip(&pb.trp, &format!("key {}", e));
+                                                        }
+                                                    }
+                                                } else {
+                                                    Log::cache_skip(&pb.trp, "deps_failed");
+                                                }
+                                            }
+                                            Ok(_) => {
+                                                Log::cache_skip(&pb.trp, "nonfile");
+                                            }
+                                            Err(e) => {
+                                                Log::cache_skip(&pb.trp, &format!("stat {}", e));
+                                            }
+                                        }
+                                    }
+                                }
+                            } else if pb.cache_key.is_some() {
+                                Log::cache_skip(&pb.trp, "commit_failed");
+                            }
+                        }
                     }
                 }
             }
@@ -747,6 +1642,8 @@ fn start_redo_unlocked_job(
 fn build_one(t: &str) -> anyhow::Result<i32> {
     let mut sf = state::File::by_name(t, true)?;
     let abs_target = env::v().base.join(&sf.name);
+    let strict = env::v().strict;
+    let strict_fail = env::v().strict_fail;
     // In "unlocked" mode (used by redo-unlocked), our caller already holds the
     // target lock, so trying to reacquire it would deadlock.
     let mut lock: Option<state::Lock> = if env::v().unlocked {
@@ -870,6 +1767,18 @@ fn build_one(t: &str) -> anyhow::Result<i32> {
     let tmpname = dodir.join(format!("{}.redo.tmp", arg1));
     unlink_best_effort(&tmpname);
 
+    let trace_out0: Option<PathBuf> = if strict {
+        let runid = env::v().runid.unwrap_or(0);
+        let d = env::v().base.join(".redo").join("trace");
+        let _ = fs::create_dir_all(&d);
+        Some(d.join(format!("readtrace.{}.{}.{}.out0", runid, sf.id, std::process::id())))
+    } else {
+        None
+    };
+    if let Some(p) = &trace_out0 {
+        let _ = fs::remove_file(p);
+    }
+
     let mut outfile = mkstemp_unlinked()?;
     let outfd = outfile.as_raw_fd();
 
@@ -887,11 +1796,24 @@ fn build_one(t: &str) -> anyhow::Result<i32> {
         let arg3 = rel_arg3.to_string_lossy().to_string();
         let rv_cell2 = rv_cell.clone();
         let lock_fid = sf.id;
+        let trace_out0_2 = trace_out0.clone();
         // Must be flushed (no open sqlite transaction) before we fork/exec.
         state::commit()?;
         jobserver::start(
             t,
-            move || exec_dofile_in_child(&dodir, &dofile, &arg1, &arg2, &arg3, outfd, lock_fid),
+            move || {
+                exec_dofile_in_child(
+                    &dodir,
+                    &dofile,
+                    &arg1,
+                    &arg2,
+                    &arg3,
+                    outfd,
+                    lock_fid,
+                    None,
+                    trace_out0_2.as_deref(),
+                )
+            },
             move |_name, rv| {
                 rv_cell2.store(rv, std::sync::atomic::Ordering::Relaxed);
             },
@@ -977,8 +1899,52 @@ fn build_one(t: &str) -> anyhow::Result<i32> {
             sf.set_changed();
         }
         sf.zap_deps2()?;
-        sf.save()?;
-        state::commit()?;
+        if strict {
+            let base = env::v().base;
+            let trace_entries: Vec<String> = match trace_out0.as_ref() {
+                Some(p) => read_trace_out0(p)
+                    .unwrap_or_else(|_| vec!["TRACE_UNAVAILABLE:read_failed".to_string()]),
+                None => vec!["TRACE_UNAVAILABLE:missing_path".to_string()],
+            };
+            if let Some(p) = trace_out0.as_ref() {
+                let _ = fs::remove_file(p);
+            }
+            let declared = sf.deps().unwrap_or_default();
+            let res = evaluate_strict_readtrace(&base, &declared, &trace_entries);
+            if !res.trace_ok {
+                let why = if res.trace_reason.is_empty() {
+                    "unknown".to_string()
+                } else {
+                    res.trace_reason.clone()
+                };
+                let msg = format!("strict: read trace unavailable ({})", why);
+                if strict_fail {
+                    Log::err(&msg);
+                    final_rv = 218;
+                } else {
+                    Log::warn(&msg);
+                }
+            } else if !res.violations.is_empty() {
+                let msg = format!("strict: undeclared reads: {}", res.violations.join(", "));
+                if strict_fail {
+                    Log::err(&msg);
+                    final_rv = 218;
+                } else {
+                    Log::warn(&msg);
+                }
+            }
+        }
+
+        if final_rv == 0 {
+            sf.save()?;
+            state::commit()?;
+        } else {
+            unlink_best_effort(&tmpname);
+            sf.set_failed()?;
+            sf.zap_deps2()?;
+            sf.save()?;
+            state::commit()?;
+        }
     } else {
         unlink_best_effort(&tmpname);
         sf.set_failed()?;

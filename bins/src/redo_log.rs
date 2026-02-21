@@ -462,6 +462,26 @@ fn catlog_stdin(
                         writeln!(out, "{}", line)?;
                     }
                 }
+                "cache_hit" | "cache_miss" | "cache_store" | "cache_skip" | "cache_stats" => {
+                    // Debug-only: cache events can be verbose.
+                    if !pretty {
+                        writeln!(out, "{}", line)?;
+                    } else if env::v().debug >= 1 {
+                        let color = match meta.kind {
+                            "cache_hit" | "cache_store" => ansi.green,
+                            "cache_miss" | "cache_skip" => ansi.yellow,
+                            _ => "",
+                        };
+                        write_pretty_line(
+                            out,
+                            ansi,
+                            debug_pids,
+                            meta.pid,
+                            color,
+                            &format!("{} {}", meta.kind, meta.msg),
+                        )?;
+                    }
+                }
                 "done" => {
                     if let Some((rv, name)) = meta.msg.split_once(' ') {
                         let rv_i = rv.parse::<i32>().unwrap_or(0);
@@ -711,6 +731,7 @@ fn catlog(
     }
     already.insert(t.to_string());
     let mydir = Path::new(t).parent().unwrap_or(Path::new(""));
+    let stdin_mode = top_arg == "-";
 
     // Follow-mode race: redo-log might start just before the target becomes locked
     // (especially when there's already an old log file from a previous run).
@@ -769,7 +790,8 @@ fn catlog(
                     saw_locked = true;
                 }
                 if !locked {
-                    if !saw_locked && follow_grace_start.elapsed() < FOLLOW_START_GRACE {
+                    if !stdin_mode && !saw_locked && follow_grace_start.elapsed() < FOLLOW_START_GRACE
+                    {
                         std::thread::sleep(std::time::Duration::from_millis(10));
                         continue;
                     }
@@ -798,7 +820,7 @@ fn catlog(
             if locked {
                 saw_locked = true;
             } else {
-                if !saw_locked && follow_grace_start.elapsed() < FOLLOW_START_GRACE {
+                if !stdin_mode && !saw_locked && follow_grace_start.elapsed() < FOLLOW_START_GRACE {
                     std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
@@ -831,6 +853,26 @@ fn catlog(
                     }
                     if !pretty {
                         writeln!(out, "{}", line)?;
+                    }
+                }
+                "cache_hit" | "cache_miss" | "cache_store" | "cache_skip" | "cache_stats" => {
+                    // Debug-only: cache events can be verbose.
+                    if !pretty {
+                        writeln!(out, "{}", line)?;
+                    } else if env::v().debug >= 1 {
+                        let color = match meta.kind {
+                            "cache_hit" | "cache_store" => ansi.green,
+                            "cache_miss" | "cache_skip" => ansi.yellow,
+                            _ => "",
+                        };
+                        write_pretty_line(
+                            out,
+                            ansi,
+                            debug_pids,
+                            meta.pid,
+                            color,
+                            &format!("{} {}", meta.kind, meta.msg),
+                        )?;
                     }
                 }
                 "done" => {

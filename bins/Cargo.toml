@@ -8,9 +8,12 @@ license.workspace = true
 anyhow.workspace = true
 redo_core = { path = "../redo_core" }
 sha1.workspace = true
+sha2.workspace = true
 pathdiff.workspace = true
 libc.workspace = true
 rusqlite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [[bin]]
 name = "redo"
@@ -59,3 +62,15 @@ path = "src/redo_unlocked.rs"
 [[bin]]
 name = "redo-browse"
 path = "src/redo_browse.rs"
+
+[[bin]]
+name = "redo-cache-server"
+path = "src/redo_cache_server.rs"
+
+[[bin]]
+name = "redo-trace"
+path = "src/redo_trace.rs"
+
+[[bin]]
+name = "redo-remote-exec"
+path = "src/redo_remote_exec.rs"
