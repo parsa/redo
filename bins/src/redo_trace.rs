@@ -217,7 +217,7 @@ fn trace_run_linux_x86_64(
         let r = libc::ptrace(
             libc::PTRACE_GETEVENTMSG,
             pid,
-            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::c_void>(),
             (&mut msg as *mut u64) as *mut libc::c_void,
         );
         if r != 0 {
@@ -246,7 +246,7 @@ fn trace_run_linux_x86_64(
                 libc::PTRACE_PEEKDATA,
                 pid,
                 (addr as usize + off) as *mut libc::c_void,
-                std::ptr::null_mut(),
+                std::ptr::null_mut::<libc::c_void>(),
             );
             let e = errno_get();
             if e != 0 {
@@ -272,7 +272,7 @@ fn trace_run_linux_x86_64(
         let r = libc::ptrace(
             libc::PTRACE_GETREGS,
             pid,
-            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::c_void>(),
             (&mut regs as *mut libc::user_regs_struct) as *mut libc::c_void,
         );
         if r != 0 {
@@ -285,7 +285,7 @@ fn trace_run_linux_x86_64(
         let r = libc::ptrace(
             libc::PTRACE_SETOPTIONS,
             pid,
-            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::c_void>(),
             opts as *mut libc::c_void,
         );
         if r != 0 {
@@ -298,7 +298,7 @@ fn trace_run_linux_x86_64(
         let r = libc::ptrace(
             libc::PTRACE_SYSCALL,
             pid,
-            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::c_void>(),
             (sig as isize) as *mut libc::c_void,
         );
         if r != 0 {
@@ -311,7 +311,7 @@ fn trace_run_linux_x86_64(
         let r = libc::ptrace(
             libc::PTRACE_CONT,
             pid,
-            std::ptr::null_mut(),
+            std::ptr::null_mut::<libc::c_void>(),
             (sig as isize) as *mut libc::c_void,
         );
         if r != 0 {
@@ -335,8 +335,8 @@ fn trace_run_linux_x86_64(
             if libc::ptrace(
                 libc::PTRACE_TRACEME,
                 0,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                std::ptr::null_mut::<libc::c_void>(),
+                std::ptr::null_mut::<libc::c_void>(),
             ) != 0
             {
                 return Err(io::Error::last_os_error());

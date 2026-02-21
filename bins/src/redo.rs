@@ -12,12 +12,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static GOT_SIGINT: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn sigint_handler(_: libc::c_int) {
-    GOT_SIGINT.store(true, Ordering::SeqCst);
+    // Async-signal-safe shutdown path:
+    // - propagate SIGINT to our process group so children die too
+    // - exit with redo's conventional SIGINT status (200)
+    unsafe {
+        let _ = libc::kill(0, libc::SIGINT);
+        libc::_exit(200);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -186,31 +189,15 @@ fn start_stdin_log_reader(
 }
 
 fn main() {
-    let default_panic = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        if GOT_SIGINT.load(Ordering::SeqCst) {
-            unsafe { libc::_exit(200) };
-        }
-        default_panic(info);
-    }));
-
     // Put redo and its children into their own process group so we can
     // propagate SIGINT cleanly.
+    let is_toplevel = std::env::var("REDO").is_err();
     unsafe {
-        libc::setpgid(0, 0);
+        if is_toplevel {
+            libc::setpgid(0, 0);
+        }
         libc::signal(libc::SIGINT, sigint_handler as usize);
     }
-    std::thread::spawn(|| {
-        while !GOT_SIGINT.load(Ordering::SeqCst) {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        unsafe {
-            // Ignore SIGINT in this process, then deliver it to the process group.
-            libc::signal(libc::SIGINT, libc::SIG_IGN);
-            libc::kill(0, libc::SIGINT);
-            libc::_exit(200);
-        }
-    });
 
     let args: Vec<String> = std::env::args().skip(1).collect();
 
@@ -434,15 +421,6 @@ fn main() {
 
     if env::is_toplevel() && env::v().log != 0 {
         await_log_reader();
-    }
-
-    // If SIGINT was seen, don't let main race the SIGINT watcher thread.
-    // The watcher is responsible for propagating SIGINT to the whole process group
-    // and exiting with status code 200.
-    if GOT_SIGINT.load(Ordering::SeqCst) {
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(1));
-        }
     }
 
     std::process::exit(rv);
